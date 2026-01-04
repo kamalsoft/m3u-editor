@@ -854,11 +854,12 @@ class StreamPreviewDialog(QDialog):
         self.info_group = QGroupBox("Stream Information")
         self.info_layout = QFormLayout(self.info_group)
         self.lbl_name = QLabel(self.entry.name)
-        self.lbl_group = QLabel(self.entry.group)
+        self.input_group = QLineEdit(self.entry.group)
+        self.input_group.textChanged.connect(self.on_group_changed)
         self.lbl_url = QLabel(self.entry.url)
         self.lbl_url.setWordWrap(True)
         self.info_layout.addRow("Name:", self.lbl_name)
-        self.info_layout.addRow("Group:", self.lbl_group)
+        self.info_layout.addRow("Group:", self.input_group)
         self.info_layout.addRow("URL:", self.lbl_url)
         live_layout.addWidget(self.info_group)
         
@@ -891,7 +892,12 @@ class StreamPreviewDialog(QDialog):
         
         self.setWindowTitle(f"Preview: {self.entry.name}")
         self.lbl_name.setText(self.entry.name)
-        self.lbl_group.setText(self.entry.group)
+        
+        # Block signals to prevent on_group_changed from firing during load
+        self.input_group.blockSignals(True)
+        self.input_group.setText(self.entry.group)
+        self.input_group.blockSignals(False)
+        
         self.lbl_url.setText(self.entry.url)
         
         # Update Storyboard widget
@@ -909,6 +915,14 @@ class StreamPreviewDialog(QDialog):
         # Update button states
         self.btn_prev.setEnabled(self.current_index > 0)
         self.btn_next.setEnabled(self.current_index < len(self.entries) - 1)
+
+    def on_group_changed(self, text):
+        self.entry.group = text
+        if self.parent():
+            # Update main window UI
+            self.parent().refresh_table()
+            self.parent().update_group_combo()
+            self.parent().set_modified(True)
 
     def prev_channel(self):
         self.load_entry(self.current_index - 1)
