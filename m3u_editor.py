@@ -1056,6 +1056,7 @@ class M3UEditorWindow(QMainWindow):
         
         self.entries: List[M3UEntry] = []
         self.current_file_path: Optional[str] = None
+        self.current_url: Optional[str] = None
         self.thread_pool = QThreadPool()
         # Limit concurrent threads to prevent resource exhaustion/crashes
         self.thread_pool.setMaxThreadCount(5)
@@ -1113,6 +1114,11 @@ class M3UEditorWindow(QMainWindow):
         self.btn_stop.clicked.connect(self.stop_background_tasks)
         self.btn_stop.setEnabled(False)
         
+        self.btn_reload = QPushButton("Reload")
+        self.btn_reload.setToolTip("Reload current file from disk")
+        self.btn_reload.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+        self.btn_reload.clicked.connect(self.reload_file)
+        
         # Search & Filter
         self.search_bar = QLineEdit()
         self.search_bar.setPlaceholderText("Search channels...")
@@ -1128,6 +1134,7 @@ class M3UEditorWindow(QMainWindow):
         toolbar.addWidget(btn_delete)
         toolbar.addWidget(self.btn_validate)
         toolbar.addWidget(self.btn_stop)
+        toolbar.addWidget(self.btn_reload)
         toolbar.addStretch()
         toolbar.addWidget(QLabel("Filter:"))
         toolbar.addWidget(self.group_combo)
@@ -1534,6 +1541,7 @@ class M3UEditorWindow(QMainWindow):
                 
                 self.model.entries = self.entries # Update model reference
                 self.current_file_path = file_name
+                self.current_url = None
                 self.setWindowTitle(f"Open Source M3U Editor - {os.path.basename(file_name)}")
                 self.add_recent_file(file_name)
                 self.refresh_table()
@@ -1579,6 +1587,7 @@ class M3UEditorWindow(QMainWindow):
 
             self.model.entries = self.entries
             self.current_file_path = path
+            self.current_url = None
             self.setWindowTitle(f"Open Source M3U Editor - {os.path.basename(path)}")
             self.add_recent_file(path)
             self.refresh_table()
@@ -1588,28 +1597,45 @@ class M3UEditorWindow(QMainWindow):
             logging.error(f"Failed to load recent file: {e}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Could not load file: {str(e)}")
 
-    def load_m3u_from_url(self):
-        url, ok = QInputDialog.getText(self, "Load M3U from URL", "Enter Playlist URL:")
-        if ok and url:
-            logging.info(f"Loading M3U from URL: {url}")
-            try:
-                with urllib.request.urlopen(url) as response:
-                    content = response.read().decode('utf-8', errors='ignore')
-                    lines = content.splitlines()
+    def reload_file(self):
+        """Reloads the currently open file or URL."""
+        if self.current_file_path:
+            logging.info(f"Reloading file: {self.current_file_path}")
+            self.load_recent_file(self.current_file_path)
+            self.status_label.setText(f"Reloaded: {os.path.basename(self.current_file_path)}")
+        elif self.current_url:
+            logging.info(f"Reloading URL: {self.current_url}")
+            self.load_m3u_from_url(self.current_url)
+            self.status_label.setText("Reloaded from URL")
+        else:
+            QMessageBox.information(self, "Reload", "No source is currently open to reload.")
+
+    def load_m3u_from_url(self, url=None):
+        if not url:
+            url, ok = QInputDialog.getText(self, "Load M3U from URL", "Enter Playlist URL:")
+            if not ok or not url:
+                return
                 
-                self.undo_stack.clear()
-                self.entries = M3UParser.parse_lines(lines)
-                self.epg_url = M3UParser.extract_header_info(lines[:5]).get('url-tvg', "")
-                self.model.entries = self.entries
-                self.current_file_path = None # No local file path
-                self.setWindowTitle(f"Open Source M3U Editor - URL Stream")
-                self.refresh_table()
-                self.update_group_combo()
-                self.status_label.setText(f"Loaded {len(self.entries)} channels from URL")
-                self.log_action("Loaded playlist from URL")
-            except Exception as e:
-                logging.error(f"Failed to load URL: {e}", exc_info=True)
-                QMessageBox.critical(self, "Error", f"Could not load URL: {str(e)}")
+        logging.info(f"Loading M3U from URL: {url}")
+        try:
+            with urllib.request.urlopen(url) as response:
+                content = response.read().decode('utf-8', errors='ignore')
+                lines = content.splitlines()
+            
+            self.undo_stack.clear()
+            self.entries = M3UParser.parse_lines(lines)
+            self.epg_url = M3UParser.extract_header_info(lines[:5]).get('url-tvg', "")
+            self.model.entries = self.entries
+            self.current_file_path = None # No local file path
+            self.current_url = url
+            self.setWindowTitle(f"Open Source M3U Editor - URL Stream")
+            self.refresh_table()
+            self.update_group_combo()
+            self.status_label.setText(f"Loaded {len(self.entries)} channels from URL")
+            self.log_action("Loaded playlist from URL")
+        except Exception as e:
+            logging.error(f"Failed to load URL: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Could not load URL: {str(e)}")
 
     def merge_m3u(self):
         file_name, _ = QFileDialog.getOpenFileName(self, "Merge M3U File", "", "M3U Files (*.m3u *.m3u8);;All Files (*)")
