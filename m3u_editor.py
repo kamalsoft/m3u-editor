@@ -404,6 +404,76 @@ class LatencyWorker(QRunnable):
         finally:
             self.signals.finished.emit()
 
+class SecurityAuditSignals(QObject):
+    result = pyqtSignal(int, dict) # row_index, results_dict
+    finished = pyqtSignal()
+
+class SecurityAuditWorker(QRunnable):
+    """Worker to perform security checks on a stream URL."""
+    def __init__(self, row_index, url):
+        super().__init__()
+        self.row_index = row_index
+        self.url = url
+        self.signals = SecurityAuditSignals()
+
+    def run(self):
+        results = {
+            "is_secure": True,
+            "ssl_valid": "N/A",
+            "content_type": "Unknown",
+            "redirects": 0,
+            "reputation": "Clean",
+            "summary": "Secure"
+        }
+        
+        try:
+            parsed_url = urllib.parse.urlparse(self.url)
+            
+            # 1. SSL/TLS Check
+            if parsed_url.scheme == "https":
+                results["ssl_valid"] = "Valid"
+            else:
+                results["ssl_valid"] = "Insecure (HTTP)"
+                results["is_secure"] = False
+                results["summary"] = "Insecure Protocol"
+
+            # 2. Reputation Check (Placeholder)
+            malicious_domains = ["malware-iptv.com", "scam-streams.net", "phishing-tv.org"]
+            if parsed_url.netloc in malicious_domains:
+                results["reputation"] = "Malicious"
+                results["is_secure"] = False
+                results["summary"] = "Malicious Domain"
+
+            # 3. Content-Type and Redirect Check
+            req = urllib.request.Request(self.url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                results["content_type"] = response.headers.get('Content-Type', 'Unknown')
+                
+                # Check if content type is suspicious for a stream
+                valid_types = ["video/", "audio/", "application/x-mpegurl", "application/vnd.apple.mpegurl"]
+                if not any(t in results["content_type"].lower() for t in valid_types):
+                    results["is_secure"] = False
+                    results["summary"] = "Suspicious Content"
+
+                # Check for redirects
+                if response.geturl() != self.url:
+                    results["redirects"] = 1 # Simple check for now
+                    if "redirect" in response.geturl().lower():
+                        results["is_secure"] = False
+                        results["summary"] = "Suspicious Redirect"
+
+            self.signals.result.emit(self.row_index, results)
+        except urllib.error.URLError as e:
+            results["is_secure"] = False
+            results["summary"] = f"Connection Error: {str(e.reason)}"
+            self.signals.result.emit(self.row_index, results)
+        except Exception as e:
+            results["is_secure"] = False
+            results["summary"] = f"Audit Failed: {str(e)}"
+            self.signals.result.emit(self.row_index, results)
+        finally:
+            self.signals.finished.emit()
+
 class PlaylistModel(QAbstractTableModel):
     """Model to handle playlist data efficiently."""
     request_logo = pyqtSignal(str)
@@ -411,19 +481,20 @@ class PlaylistModel(QAbstractTableModel):
     def __init__(self, entries=None, parent=None):
         super().__init__(parent)
         self.entries = entries or []
-        self.headers = ["Group", "Name", "URL"]
+        self.headers = ["Group", "Name", "URL", "Security"]
         self.validation_data = {}  # id(entry) -> (color, msg, is_valid)
         self.highlight_data = {}   # id(entry) -> color
         self.logo_cache = {}       # url -> QPixmap
         self.pending_logos = set() # urls currently fetching
         self.logo_loader = None # Will be set by window
         self.logo_map = {} # url -> list of row indices
+        self.security_data = {} # id(entry) -> results_dict
 
     def rowCount(self, parent=None):
         return len(self.entries)
 
     def columnCount(self, parent=None):
-        return 3
+        return 4
 
     def rebuild_logo_map(self):
         self.logo_map = {}
@@ -447,6 +518,9 @@ class PlaylistModel(QAbstractTableModel):
             if index.column() == 0: return entry.group
             if index.column() == 1: return entry.name
             if index.column() == 2: return entry.url
+            if index.column() == 3:
+                audit = self.security_data.get(id(entry))
+                return audit["summary"] if audit else "Not Audited"
             
         elif role == Qt.ItemDataRole.UserRole:
             return entry
@@ -460,7 +534,16 @@ class PlaylistModel(QAbstractTableModel):
             return self.highlight_data.get(id(entry))
             
         elif role == Qt.ItemDataRole.ToolTipRole:
-            return self.validation_data.get(id(entry), (None, None, None))[1]
+            val_msg = self.validation_data.get(id(entry), (None, None, None))[1]
+            audit = self.security_data.get(id(entry))
+            if audit:
+                audit_msg = (f"Security Audit:\n"
+                             f"- SSL: {audit['ssl_valid']}\n"
+                             f"- Content: {audit['content_type']}\n"
+                             f"- Reputation: {audit['reputation']}\n"
+                             f"- Redirects: {audit['redirects']}")
+                return f"{val_msg}\n\n{audit_msg}" if val_msg else audit_msg
+            return val_msg
             
         elif role == Qt.ItemDataRole.DecorationRole:
             # Show logo in Name column (1) or all columns if needed
@@ -471,6 +554,12 @@ class PlaylistModel(QAbstractTableModel):
                     self.pending_logos.add(entry.logo)
                     if self.logo_loader:
                         self.logo_loader.request_logo(entry.logo)
+            
+            if index.column() == 3:
+                audit = self.security_data.get(id(entry))
+                if audit:
+                    icon_name = QStyle.StandardPixmap.SP_DialogApplyButton if audit["is_secure"] else QStyle.StandardPixmap.SP_MessageBoxWarning
+                    return QApplication.style().standardIcon(icon_name)
             return None
             
         return None
@@ -858,10 +947,17 @@ class StreamPreviewDialog(QDialog):
         self.input_group.textChanged.connect(self.on_group_changed)
         self.lbl_url = QLabel(self.entry.url)
         self.lbl_url.setWordWrap(True)
+        self.lbl_security = QLabel("Not Audited")
         self.info_layout.addRow("Name:", self.lbl_name)
         self.info_layout.addRow("Group:", self.input_group)
         self.info_layout.addRow("URL:", self.lbl_url)
+        self.info_layout.addRow("Security:", self.lbl_security)
         live_layout.addWidget(self.info_group)
+        
+        # Loading Animation Timer
+        self.loading_timer = QTimer(self)
+        self.loading_timer.timeout.connect(self.update_loading_animation)
+        self.loading_dots = 0
         
         self.tabs.addTab(self.live_tab, "Live Preview")
         
@@ -900,13 +996,26 @@ class StreamPreviewDialog(QDialog):
         
         self.lbl_url.setText(self.entry.url)
         
+        # Update Security Status
+        if self.parent() and hasattr(self.parent(), 'model'):
+            audit = self.parent().model.security_data.get(id(self.entry))
+            if audit:
+                self.lbl_security.setText(audit["summary"])
+                color = "#50fa7b" if audit["is_secure"] else "#ff5555"
+                self.lbl_security.setStyleSheet(f"color: {color}; font-weight: bold;")
+            else:
+                self.lbl_security.setText("Not Audited")
+                self.lbl_security.setStyleSheet("")
+        
         # Update Storyboard widget
         self.storyboard_widget.url = self.entry.url
         self.storyboard_widget.status_lbl.setText("Ready to generate storyboard.")
         
-        self.status_overlay.setText("Loading Stream...")
+        self.status_overlay.setText("Loading Stream")
         self.status_overlay.setVisible(True)
         self.video_widget.setVisible(False)
+        self.loading_dots = 0
+        self.loading_timer.start(500)
         
         self.player.stop()
         self.player.setSource(QUrl(self.entry.url))
@@ -940,14 +1049,26 @@ class StreamPreviewDialog(QDialog):
         if status == QMediaPlayer.MediaStatus.BufferedMedia or status == QMediaPlayer.MediaStatus.LoadedMedia:
             self.status_overlay.setVisible(False)
             self.video_widget.setVisible(True)
-        elif status == QMediaPlayer.MediaStatus.LoadingMedia or status == QMediaPlayer.MediaStatus.StalledMedia:
-            self.status_overlay.setText("Buffering...")
+            self.loading_timer.stop()
+        elif status == QMediaPlayer.MediaStatus.LoadingMedia:
+            self.status_overlay.setText("Connecting")
             self.status_overlay.setVisible(True)
             self.video_widget.setVisible(False)
+        elif status == QMediaPlayer.MediaStatus.StalledMedia:
+            self.status_overlay.setText("Buffering")
+            self.status_overlay.setVisible(True)
+            self.video_widget.setVisible(False)
+            self.loading_timer.start(500)
         elif status == QMediaPlayer.MediaStatus.InvalidMedia:
             self.status_overlay.setText("Error: Invalid Stream")
             self.status_overlay.setVisible(True)
             self.video_widget.setVisible(False)
+            self.loading_timer.stop()
+
+    def update_loading_animation(self):
+        self.loading_dots = (self.loading_dots + 1) % 4
+        base_text = self.status_overlay.text().rstrip(".")
+        self.status_overlay.setText(base_text + "." * self.loading_dots)
 
     def toggle_playback(self):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
@@ -1256,6 +1377,7 @@ class M3UEditorWindow(QMainWindow):
         self.thread_pool.setMaxThreadCount(5)
         self.validation_pending_count = 0
         self.scrape_pending_count = 0
+        self.audit_pending_count = 0
         self.undo_stack = EfficientUndoStack(max_depth=50)
         self.is_modified = False
         self.editing_started = False
@@ -1304,6 +1426,10 @@ class M3UEditorWindow(QMainWindow):
         self.btn_validate.setToolTip("Validate Stream URLs")
         self.btn_validate.clicked.connect(self.validate_streams)
         
+        self.btn_audit = QPushButton("Security Audit")
+        self.btn_audit.setToolTip("Audit streams for security and authenticity")
+        self.btn_audit.clicked.connect(self.audit_streams)
+        
         self.btn_stop = QPushButton("Stop Tasks")
         self.btn_stop.setToolTip("Stop all background processes")
         self.btn_stop.clicked.connect(self.stop_background_tasks)
@@ -1334,6 +1460,7 @@ class M3UEditorWindow(QMainWindow):
         toolbar.addWidget(btn_add)
         toolbar.addWidget(btn_delete)
         toolbar.addWidget(self.btn_validate)
+        toolbar.addWidget(self.btn_audit)
         toolbar.addWidget(self.btn_stop)
         toolbar.addWidget(self.btn_save)
         toolbar.addWidget(self.btn_reload)
@@ -1366,6 +1493,7 @@ class M3UEditorWindow(QMainWindow):
         self.table.setModel(self.proxy_model)
         
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.setDragEnabled(True)
@@ -1644,6 +1772,7 @@ class M3UEditorWindow(QMainWindow):
         self.thread_pool.clear()
         self.validation_pending_count = 0
         self.scrape_pending_count = 0
+        self.audit_pending_count = 0
         
         # Reset UI state
         self.progress_bar.setVisible(False)
@@ -2052,14 +2181,58 @@ class M3UEditorWindow(QMainWindow):
         self.input_logo.clear()
         self.input_url.clear()
         self.input_user_agent.clear()
+
+    def audit_streams(self):
+        selected_rows = self.table.selectionModel().selectedRows()
+        rows_to_check = []
         
-        self.input_name.blockSignals(False)
-        self.input_group.blockSignals(False)
-        self.input_tvg_id.blockSignals(False)
-        self.input_chno.blockSignals(False)
-        self.input_logo.blockSignals(False)
-        self.input_url.blockSignals(False)
-        self.input_user_agent.blockSignals(False)
+        if selected_rows:
+            for index in selected_rows:
+                source_index = self.proxy_model.mapToSource(index)
+                rows_to_check.append((source_index.row(), self.entries[source_index.row()].url))
+        else:
+            for row, entry in enumerate(self.entries):
+                rows_to_check.append((row, entry.url))
+        
+        if not rows_to_check:
+            return
+
+        self.btn_stop.setEnabled(True)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setMaximum(len(rows_to_check))
+        self.status_label.setText(f"Auditing {len(rows_to_check)} streams...")
+        
+        self.audit_pending_count = len(rows_to_check)
+        
+        for row, url in rows_to_check:
+            worker = SecurityAuditWorker(row, url)
+            worker.signals.result.connect(self.on_audit_result)
+            worker.signals.finished.connect(self.on_audit_finished)
+            self.thread_pool.start(worker)
+
+    def on_audit_result(self, row, results):
+        if row < len(self.entries):
+            entry = self.entries[row]
+            self.model.security_data[id(entry)] = results
+            # Update the Security column (3)
+            idx = self.model.index(row, 3)
+            self.model.dataChanged.emit(idx, idx)
+
+    def on_audit_finished(self):
+        self.audit_pending_count -= 1
+        total = self.progress_bar.maximum()
+        val = total - self.audit_pending_count
+        self.progress_bar.setValue(val)
+        self.status_label.setText(f"Auditing streams: {val}/{total}...")
+        
+        if self.audit_pending_count <= 0:
+            self.btn_stop.setEnabled(False)
+            self.progress_bar.setVisible(False)
+            self.status_label.setText("Security audit complete.")
+            self.log_action("Security audit completed")
+            QMessageBox.information(self, "Success", "Security audit complete.")
+        
 
     def update_current_entry_data(self):
         """Updates the data model when the user types in the editor fields."""
