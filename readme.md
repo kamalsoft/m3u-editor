@@ -75,10 +75,11 @@ This application prioritizes your security:
 
 ## Roadmap
 
-*   **Xtream Codes**: Login support for IPTV providers.
-*   **EPG Integration**: Support for XMLTV files to show program guides.
-*   **Favorites**: Quick access to frequently used channels.
-*   **Batch Rename**: Regex-based search and replace for channel names.
+*   **EPG (Electronic Program Guide) Integration**: Support for XMLTV files to display "Now Playing" information and full program schedules.
+*   **Xtream Codes API Support**: Direct login support for IPTV providers using Xtream Codes credentials for automatic playlist and EPG updates.
+*   **Advanced Playlist Deduplication & Merging**: A smart wizard to combine multiple playlists, intelligently detect duplicates, and manage stream sources.
+*   **Favorites System**: Quick access to frequently used channels with a dedicated "Favorites" group.
+*   **Batch Rename & Find/Replace**: Advanced regex-based tools for bulk channel name and metadata editing.
 
 ## License
 
