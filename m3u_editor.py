@@ -13,7 +13,8 @@ import xml.etree.ElementTree as ET
 import time
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Iterable
+from typing import List, Optional, Iterable, Dict, Any
+from performance_utils import ThrottledLogoLoader, EfficientUndoStack, FastM3UParser
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -21,7 +22,8 @@ from PyQt6.QtWidgets import (
     QFileDialog, QMessageBox, QHeaderView, QSplitter, QGroupBox, QFormLayout,
     QInputDialog, QAbstractItemView, QProgressBar, QGraphicsOpacityEffect,
     QMenu, QComboBox, QDialog, QDialogButtonBox, QCheckBox, QTabWidget,
-    QListView, QStackedWidget, QSpinBox, QTextEdit, QTableWidget, QTableWidgetItem
+    QListView, QStackedWidget, QSpinBox, QTextEdit, QTableWidget, QTableWidgetItem,
+    QSlider, QStyle
 )
 from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QUrl, QPropertyAnimation, 
                           QEasingCurve, QAbstractAnimation, QSettings, QAbstractTableModel,
@@ -104,72 +106,24 @@ class M3UParser:
     @staticmethod
     def parse_lines(lines: Iterable[str]) -> List[M3UEntry]:
         logging.debug("Starting to parse lines...")
+        raw_entries = FastM3UParser.parse_lines(list(lines))
         entries = []
-        current_entry = None
-        
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            
-            if line.startswith("#EXTM3U"):
-                continue
-            
-            if line.startswith("#EXTINF:"):
-                # Parse metadata
-                # Example: #EXTINF:-1 tvg-id="" group-title="News",Channel Name
-                current_entry = M3UEntry(name="", url="")
-                
-                # Split duration/info from the rest
-                # Regex to capture duration, attributes, and name
-                # This is a simplified regex for standard M3U8 structures
-                meta_match = re.match(r'^#EXTINF:([-0-9]+)(.*),(.*)$', line)
-                
-                if meta_match:
-                    current_entry.duration = meta_match.group(1)
-                    attrs = meta_match.group(2)
-                    current_entry.name = meta_match.group(3).strip()
-                    
-                    # Extract Group
-                    grp_match = re.search(r'group-title="([^"]*)"', attrs)
-                    if grp_match:
-                        current_entry.group = grp_match.group(1)
-                        
-                    # Extract TVG ID
-                    id_match = re.search(r'tvg-id="([^"]*)"', attrs)
-                    if id_match:
-                        current_entry.tvg_id = id_match.group(1)
-
-                    # Extract Logo
-                    logo_match = re.search(r'tvg-logo="([^"]*)"', attrs)
-                    if logo_match:
-                        current_entry.logo = logo_match.group(1)
-                        
-                    # Extract Channel Number
-                    chno_match = re.search(r'tvg-chno="([^"]*)"', attrs)
-                    if chno_match:
-                        current_entry.tvg_chno = chno_match.group(1)
-                else:
-                    # Fallback if regex fails
-                    current_entry.name = line.split(',')[-1]
-
-            elif line.startswith("#EXTVLCOPT:"):
-                if current_entry:
-                    opt = line[11:].strip()
-                    if opt.lower().startswith("http-user-agent="):
-                        current_entry.user_agent = opt.split('=', 1)[1]
-
-            elif not line.startswith("#"):
-                # This is likely the URL
-                if current_entry:
-                    current_entry.url = line
-                    entries.append(current_entry)
-                    current_entry = None
-                else:
-                    # URL without EXTINF (rare but possible)
-                    entries.append(M3UEntry(name="Unknown", url=line))
+        for e in raw_entries:
+            entry = M3UEntry(
+                name=e.get("name", "Unknown"),
+                url=e.get("url", ""),
+                group=e.get("group", ""),
+                logo=e.get("logo", e.get("tvg_logo", "")),
+                tvg_id=e.get("tvg_id", ""),
+                tvg_chno=e.get("tvg_chno", ""),
+                duration=e.get("duration", "-1"),
+                user_agent=e.get("user_agent", ""),
+                raw_extinf=e.get("raw_extinf", "")
+            )
+            entries.append(entry)
         logging.debug(f"Finished parsing. Found {len(entries)} entries.")
         return entries
+
 
     @staticmethod
     def parse_file(filepath: str) -> List[M3UEntry]:
@@ -462,12 +416,22 @@ class PlaylistModel(QAbstractTableModel):
         self.highlight_data = {}   # id(entry) -> color
         self.logo_cache = {}       # url -> QPixmap
         self.pending_logos = set() # urls currently fetching
+        self.logo_loader = None # Will be set by window
+        self.logo_map = {} # url -> list of row indices
 
     def rowCount(self, parent=None):
         return len(self.entries)
 
     def columnCount(self, parent=None):
         return 3
+
+    def rebuild_logo_map(self):
+        self.logo_map = {}
+        for row, entry in enumerate(self.entries):
+            if entry.logo:
+                if entry.logo not in self.logo_map:
+                    self.logo_map[entry.logo] = []
+                self.logo_map[entry.logo].append(row)
 
     def data(self, index, role):
         if not index.isValid():
@@ -505,7 +469,8 @@ class PlaylistModel(QAbstractTableModel):
                     return self.logo_cache[entry.logo]
                 elif entry.logo not in self.pending_logos:
                     self.pending_logos.add(entry.logo)
-                    self.request_logo.emit(entry.logo)
+                    if self.logo_loader:
+                        self.logo_loader.request_logo(entry.logo)
             return None
             
         return None
@@ -539,6 +504,9 @@ class PlaylistProxyModel(QSortFilterProxyModel):
 
     def filterAcceptsRow(self, source_row, source_parent):
         model = self.sourceModel()
+        if source_row >= len(model.entries):
+            return False
+            
         entry = model.entries[source_row]
         
         name_match = self.filter_text.lower() in entry.name.lower()
@@ -702,18 +670,18 @@ class ChannelNumberingDialog(QDialog):
         return (self.start_num.value(), self.sort_group.isChecked(), 
                 self.reset_group.isChecked(), self.target_combo.currentIndex())
 
-class StoryboardDialog(QDialog):
-    def __init__(self, parent=None, url=""):
+class StoryboardWidget(QWidget):
+    """Widget to generate and display a storyboard of frames from a stream."""
+    def __init__(self, url="", parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Stream Preview (Storyboard)")
-        self.resize(800, 300)
         self.url = url
         self.frames_captured = 0
         self.max_frames = 5
         
         layout = QVBoxLayout(self)
         
-        self.status_lbl = QLabel("Initializing stream...")
+        self.status_lbl = QLabel("Ready to generate storyboard.")
+        self.status_lbl.setStyleSheet("color: #89b4fa; font-weight: bold;")
         layout.addWidget(self.status_lbl)
         
         self.list_widget = QListView()
@@ -722,30 +690,45 @@ class StoryboardDialog(QDialog):
         self.list_widget.setUniformItemSizes(False)
         self.list_widget.setIconSize(QSize(160, 90))
         self.list_widget.setSpacing(10)
+        self.list_widget.setStyleSheet("""
+            QListView {
+                background-color: #1e1e2e;
+                border: 1px solid #313244;
+                border-radius: 8px;
+            }
+            QListView::item {
+                color: #cdd6f4;
+            }
+        """)
         
         self.model = QStandardItemModel()
         self.list_widget.setModel(self.model)
-        
         layout.addWidget(self.list_widget)
+        
+        self.btn_generate = QPushButton("Generate Storyboard")
+        self.btn_generate.clicked.connect(self.start_generation)
+        layout.addWidget(self.btn_generate)
         
         # Player setup
         self.player = QMediaPlayer()
         self.audio = QAudioOutput()
-        self.audio.setVolume(0) # Mute
+        self.audio.setVolume(0) # Mute for storyboard
         self.player.setAudioOutput(self.audio)
         
         self.video_sink = QVideoSink()
         self.player.setVideoSink(self.video_sink)
         
-        self.player.setSource(QUrl(self.url))
-        
-        # Timer for snapshots
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.capture_frame)
-        
-        # Start
+
+    def start_generation(self):
+        self.model.clear()
+        self.frames_captured = 0
+        self.btn_generate.setEnabled(False)
+        self.status_lbl.setText("Initializing stream...")
+        self.player.setSource(QUrl(self.url))
         self.player.play()
-        self.timer.start(2000) # Capture every 2 seconds
+        self.timer.start(2000)
 
     def capture_frame(self):
         frame = self.video_sink.videoFrame()
@@ -762,14 +745,152 @@ class StoryboardDialog(QDialog):
             self.status_lbl.setText(f"Captured {self.frames_captured}/{self.max_frames} frames")
             
             if self.frames_captured >= self.max_frames:
-                self.timer.stop()
-                self.player.stop()
-                self.status_lbl.setText("Storyboard generation complete.")
+                self.stop_generation()
         else:
             self.status_lbl.setText("Waiting for video frame...")
+
+    def stop_generation(self):
+        self.timer.stop()
+        self.player.stop()
+        self.btn_generate.setEnabled(True)
+        self.status_lbl.setText("Storyboard generation complete.")
+
+    def cleanup(self):
+        self.timer.stop()
+        self.player.stop()
             
     def closeEvent(self, event):
         self.player.stop()
+        super().closeEvent(event)
+
+class StreamPreviewDialog(QDialog):
+    """Enhanced dialog for live stream preview and storyboard generation."""
+    def __init__(self, entry, parent=None):
+        super().__init__(parent)
+        self.entry = entry
+        self.setWindowTitle(f"Preview: {entry.name}")
+        self.resize(900, 600)
+        
+        layout = QVBoxLayout(self)
+        
+        # Tab Widget
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+        
+        # --- Live Preview Tab ---
+        self.live_tab = QWidget()
+        live_layout = QVBoxLayout(self.live_tab)
+        
+        # Video Widget
+        self.video_widget = QVideoWidget()
+        self.video_widget.setMinimumSize(640, 360)
+        self.video_widget.setStyleSheet("background-color: black; border-radius: 8px;")
+        live_layout.addWidget(self.video_widget)
+        
+        # Playback Controls
+        controls_layout = QHBoxLayout()
+        
+        self.btn_play_pause = QPushButton()
+        self.btn_play_pause.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
+        self.btn_play_pause.clicked.connect(self.toggle_playback)
+        controls_layout.addWidget(self.btn_play_pause)
+        
+        self.btn_stop = QPushButton()
+        self.btn_stop.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaStop))
+        self.btn_stop.clicked.connect(self.stop_playback)
+        controls_layout.addWidget(self.btn_stop)
+        
+        controls_layout.addStretch()
+        
+        # Volume Control
+        self.btn_mute = QPushButton()
+        self.btn_mute.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaVolume))
+        self.btn_mute.clicked.connect(self.toggle_mute)
+        controls_layout.addWidget(self.btn_mute)
+        
+        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setValue(70)
+        self.volume_slider.setFixedWidth(100)
+        self.volume_slider.valueChanged.connect(self.set_volume)
+        controls_layout.addWidget(self.volume_slider)
+        
+        # Fullscreen Button
+        self.btn_fullscreen = QPushButton()
+        self.btn_fullscreen.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TitleBarMaxButton))
+        self.btn_fullscreen.clicked.connect(self.toggle_fullscreen)
+        controls_layout.addWidget(self.btn_fullscreen)
+        
+        live_layout.addLayout(controls_layout)
+        
+        # Stream Info
+        info_group = QGroupBox("Stream Information")
+        info_layout = QFormLayout(info_group)
+        info_layout.addRow("Name:", QLabel(entry.name))
+        info_layout.addRow("Group:", QLabel(entry.group))
+        url_lbl = QLabel(entry.url)
+        url_lbl.setWordWrap(True)
+        info_layout.addRow("URL:", url_lbl)
+        live_layout.addWidget(info_group)
+        
+        self.tabs.addTab(self.live_tab, "Live Preview")
+        
+        # --- Storyboard Tab ---
+        self.storyboard_widget = StoryboardWidget(entry.url)
+        self.tabs.addTab(self.storyboard_widget, "Storyboard")
+        
+        # Media Player Setup
+        self.player = QMediaPlayer()
+        self.audio_output = QAudioOutput()
+        self.player.setAudioOutput(self.audio_output)
+        self.player.setVideoOutput(self.video_widget)
+        self.audio_output.setVolume(0.7)
+        
+        self.player.errorOccurred.connect(self.handle_error)
+        
+        # Start Playback
+        self.player.setSource(QUrl(entry.url))
+        self.player.play()
+
+    def toggle_playback(self):
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+            self.btn_play_pause.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+        else:
+            self.player.play()
+            self.btn_play_pause.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
+
+    def stop_playback(self):
+        self.player.stop()
+        self.btn_play_pause.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+
+    def set_volume(self, value):
+        self.audio_output.setVolume(value / 100.0)
+        if value == 0:
+            self.btn_mute.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaVolumeMuted))
+        else:
+            self.btn_mute.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaVolume))
+
+    def toggle_mute(self):
+        is_muted = self.audio_output.isMuted()
+        self.audio_output.setMuted(not is_muted)
+        if not is_muted:
+            self.btn_mute.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaVolumeMuted))
+        else:
+            self.btn_mute.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaVolume))
+
+    def toggle_fullscreen(self):
+        if self.video_widget.isFullScreen():
+            self.video_widget.showNormal()
+        else:
+            self.video_widget.showFullScreen()
+
+    def handle_error(self, error, error_str):
+        QMessageBox.critical(self, "Playback Error", f"Could not play stream:\n{error_str}")
+
+    def closeEvent(self, event):
+        self.player.stop()
+        self.storyboard_widget.cleanup()
         super().closeEvent(event)
 
 class StatisticsDialog(QDialog):
@@ -940,8 +1061,7 @@ class M3UEditorWindow(QMainWindow):
         self.thread_pool.setMaxThreadCount(5)
         self.validation_pending_count = 0
         self.scrape_pending_count = 0
-        self.undo_stack: List[List[M3UEntry]] = []
-        self.redo_stack: List[List[M3UEntry]] = []
+        self.undo_stack = EfficientUndoStack(max_depth=50)
         self.editing_started = False
         self.is_dark_mode = True # Default to dark mode for "fancy" look
         self.settings = QSettings("OpenSource", "M3UEditor")
@@ -955,7 +1075,13 @@ class M3UEditorWindow(QMainWindow):
         
         # Apply initial theme
         self.toggle_theme(initial=True)
+        
+        # Performance Utils
+        self.logo_loader = ThrottledLogoLoader(self.thread_pool)
+        self.logo_loader.signals.result.connect(self.on_logo_loaded)
+        
         self.init_ui()
+        self.model.logo_loader = self.logo_loader
 
     def init_ui(self):
         # Main Layout
@@ -1365,37 +1491,29 @@ class M3UEditorWindow(QMainWindow):
 
     def save_undo_state(self):
         """Saves the current state of entries to the undo stack."""
-        if len(self.undo_stack) > 50: # Limit stack depth
-            self.undo_stack.pop(0)
-        self.undo_stack.append(copy.deepcopy(self.entries))
-        self.redo_stack.clear() # Clear redo history when a new action occurs
-        self.status_label.setText("State saved.")
+        self.undo_stack.push(self.entries)
 
     def undo(self):
-        if not self.undo_stack:
+        prev_state = self.undo_stack.undo(self.entries)
+        if prev_state is not None:
+            self.entries = prev_state
+            self.model.entries = self.entries
+            self.refresh_table(clear_cache=False)
+            self.update_group_combo()
+            self.log_action("Undo performed")
+        else:
             self.status_label.setText("Nothing to undo.")
-            return
-        
-        # Save current state to redo stack before reverting
-        self.redo_stack.append(copy.deepcopy(self.entries))
-        
-        self.entries = self.undo_stack.pop()
-        self.refresh_table()
-        self.clear_editor()
-        self.status_label.setText("Undone last action.")
-        self.log_action("Undo performed")
 
     def redo(self):
-        if not self.redo_stack:
+        next_state = self.undo_stack.redo(self.entries)
+        if next_state is not None:
+            self.entries = next_state
+            self.model.entries = self.entries
+            self.refresh_table(clear_cache=False)
+            self.update_group_combo()
+            self.log_action("Redo performed")
+        else:
             self.status_label.setText("Nothing to redo.")
-            return
-
-        self.undo_stack.append(copy.deepcopy(self.entries))
-        self.entries = self.redo_stack.pop()
-        self.refresh_table()
-        self.clear_editor()
-        self.status_label.setText("Redone last action.")
-        self.log_action("Redo performed")
 
     def load_m3u(self):
         file_name, _ = QFileDialog.getOpenFileName(self, "Open M3U File", "", "M3U Files (*.m3u *.m3u8);;All Files (*)")
@@ -1403,7 +1521,6 @@ class M3UEditorWindow(QMainWindow):
             logging.info(f"Attempting to load M3U file: {file_name}")
             try:
                 self.undo_stack.clear()
-                self.redo_stack.clear()
                 self.entries = M3UParser.parse_file(file_name)
                 
                 # Try to extract EPG URL from header
@@ -1450,7 +1567,6 @@ class M3UEditorWindow(QMainWindow):
         logging.info(f"Loading recent file: {path}")
         try:
             self.undo_stack.clear()
-            self.redo_stack.clear()
             self.entries = M3UParser.parse_file(path)
             
             with open(path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -1482,7 +1598,6 @@ class M3UEditorWindow(QMainWindow):
                     lines = content.splitlines()
                 
                 self.undo_stack.clear()
-                self.redo_stack.clear()
                 self.entries = M3UParser.parse_lines(lines)
                 self.epg_url = M3UParser.extract_header_info(lines[:5]).get('url-tvg', "")
                 self.model.entries = self.entries
@@ -1572,13 +1687,16 @@ class M3UEditorWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Could not export: {str(e)}")
 
-    def refresh_table(self):
+    def refresh_table(self, clear_cache=True):
         """Reloads the table widget from the self.entries list."""
         logging.debug("Refreshing table view...")
+        self.model.beginResetModel()
         self.model.validation_data.clear()
         self.model.highlight_data.clear()
-        self.model.layoutChanged.emit()
-        self.model.logo_cache.clear() # Clear logo cache on full refresh
+        if clear_cache:
+            self.model.logo_cache.clear()
+        self.model.rebuild_logo_map()
+        self.model.endResetModel()
         logging.debug("Table refresh complete.")
         # self.animate_table_refresh() # Animation can be glitchy with proxy resets
 
@@ -1681,6 +1799,7 @@ class M3UEditorWindow(QMainWindow):
             self.save_undo_state()
             self.editing_started = True
         
+        old_logo = entry.logo
         entry.name = self.input_name.text()
         entry.group = self.input_group.text()
         entry.tvg_id = self.input_tvg_id.text()
@@ -1689,6 +1808,9 @@ class M3UEditorWindow(QMainWindow):
         entry.url = self.input_url.text()
         entry.user_agent = self.input_user_agent.text()
         
+        if entry.logo != old_logo:
+            self.model.rebuild_logo_map()
+            
         # Update table display immediately (optional, but looks nice)
         self.model.dataChanged.emit(self.model.index(row, 0), self.model.index(row, 2))
 
@@ -1725,6 +1847,7 @@ class M3UEditorWindow(QMainWindow):
             
             for index in sorted(source_indices, key=lambda x: x.row(), reverse=True):
                 del self.entries[index.row()]
+            self.model.rebuild_logo_map()
             self.model.endResetModel()
             self.clear_editor()
             self.log_action(f"Deleted {count} entries")
@@ -1789,8 +1912,8 @@ class M3UEditorWindow(QMainWindow):
         self.proxy_model.invalidateFilter()
 
     def bulk_edit_group(self):
-        selected_rows = self.table.selectionModel().selectedRows()
-        if not selected_rows:
+        selected_indices = self.get_selected_rows()
+        if not selected_indices:
             QMessageBox.warning(self, "Warning", "No channels selected.")
             return
             
@@ -1798,21 +1921,21 @@ class M3UEditorWindow(QMainWindow):
         if ok:
             self.create_backup("bulk_group")
             self.save_undo_state()
-            for index in selected_rows:
-                source_index = self.proxy_model.mapToSource(index)
-                row = source_index.row()
-                entry = self.entries[row]
-                entry.group = new_group
-            self.refresh_table()
             
-            # Update editor if the primary selection was updated
-            if selected_rows and selected_rows[0].row() == self.table.currentIndex().row():
-                self.input_group.setText(new_group)
-            self.log_action(f"Bulk edited group for {len(selected_rows)} items")
+            # Capture source rows before modification
+            rows = [self.proxy_model.mapToSource(idx).row() for idx in selected_indices]
+            
+            for row in rows:
+                if 0 <= row < len(self.entries):
+                    self.entries[row].group = new_group
+            
+            self.refresh_table(clear_cache=False)
+            self.update_group_combo()
+            self.log_action(f"Bulk edited group for {len(rows)} items")
 
     def batch_edit_user_agent(self):
-        selected_rows = self.table.selectionModel().selectedRows()
-        if not selected_rows:
+        selected_indices = self.get_selected_rows()
+        if not selected_indices:
             QMessageBox.warning(self, "Warning", "No channels selected.")
             return
             
@@ -1820,16 +1943,16 @@ class M3UEditorWindow(QMainWindow):
         if ok:
             self.create_backup("batch_ua")
             self.save_undo_state()
-            for index in selected_rows:
-                source_index = self.proxy_model.mapToSource(index)
-                row = source_index.row()
-                entry = self.entries[row]
-                entry.user_agent = new_ua
-            self.refresh_table()
             
-            if selected_rows and selected_rows[0].row() == self.table.currentIndex().row():
-                self.input_user_agent.setText(new_ua)
-            self.log_action(f"Batch edited User-Agent for {len(selected_rows)} items")
+            # Capture source rows before modification
+            rows = [self.proxy_model.mapToSource(idx).row() for idx in selected_indices]
+            
+            for row in rows:
+                if 0 <= row < len(self.entries):
+                    self.entries[row].user_agent = new_ua
+            
+            self.refresh_table(clear_cache=False)
+            self.log_action(f"Batch edited User-Agent for {len(rows)} items")
 
     def find_replace(self):
         dlg = FindReplaceDialog(self)
@@ -2332,12 +2455,13 @@ class M3UEditorWindow(QMainWindow):
             pixmap = pixmap.scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             self.model.logo_cache[url] = pixmap
             self.model.pending_logos.discard(url)
-            # Trigger update
-            self.model.layoutChanged.emit()
-            for row, entry in enumerate(self.entries):
-                if entry.logo == url:
-                    idx = self.model.index(row, 1)
-                    self.model.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DecorationRole])
+            
+            # Use logo_map for targeted updates instead of full layoutChanged
+            if url in self.model.logo_map:
+                for row in self.model.logo_map[url]:
+                    if 0 <= row < len(self.entries):
+                        idx = self.model.index(row, 1)
+                        self.model.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DecorationRole])
 
     def find_duplicates(self):
         seen_urls = set()
@@ -2527,15 +2651,15 @@ class M3UEditorWindow(QMainWindow):
             QMessageBox.warning(self, "Error", f"Could not start VLC: {e}\nEnsure VLC is installed and in your PATH.")
 
     def open_stream_preview(self):
-        selected_rows = self.table.selectionModel().selectedRows()
-        if not selected_rows:
+        selected_indices = self.get_selected_rows()
+        if not selected_indices:
             return
             
-        proxy_index = selected_rows[0]
+        proxy_index = selected_indices[0]
         source_index = self.proxy_model.mapToSource(proxy_index)
         entry = self.entries[source_index.row()]
         
-        dlg = StoryboardDialog(self, entry.url)
+        dlg = StreamPreviewDialog(entry, self)
         dlg.exec()
 
     def open_statistics(self):
