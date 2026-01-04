@@ -618,7 +618,7 @@ class FindReplaceDialog(QDialog):
         self.find_input = QLineEdit()
         self.replace_input = QLineEdit()
         self.field_combo = QComboBox()
-        self.field_combo.addItems(["Name", "URL", "Group"])
+        self.field_combo.addItems(["Name", "URL", "Group", "Logo", "Tvg-ID", "Tvg-Chno", "User-Agent"])
         self.case_check = QCheckBox("Case Sensitive")
         
         form.addRow("Find:", self.find_input)
@@ -760,16 +760,18 @@ class StoryboardWidget(QWidget):
         self.player.stop()
             
     def closeEvent(self, event):
-        self.player.stop()
+        self.cleanup()
         super().closeEvent(event)
 
 class StreamPreviewDialog(QDialog):
     """Enhanced dialog for live stream preview and storyboard generation."""
-    def __init__(self, entry, parent=None):
+    def __init__(self, entries, current_index, parent=None):
         super().__init__(parent)
-        self.entry = entry
-        self.setWindowTitle(f"Preview: {entry.name}")
-        self.resize(900, 600)
+        self.entries = entries
+        self.current_index = current_index
+        self.entry = self.entries[self.current_index]
+        self.setWindowTitle(f"Preview: {self.entry.name}")
+        self.resize(1000, 700)
         
         layout = QVBoxLayout(self)
         
@@ -781,14 +783,33 @@ class StreamPreviewDialog(QDialog):
         self.live_tab = QWidget()
         live_layout = QVBoxLayout(self.live_tab)
         
-        # Video Widget
+        # Video Widget Container (for status overlay)
+        self.video_container = QWidget()
+        self.video_container_layout = QVBoxLayout(self.video_container)
+        self.video_container_layout.setContentsMargins(0, 0, 0, 0)
+        
         self.video_widget = QVideoWidget()
         self.video_widget.setMinimumSize(640, 360)
         self.video_widget.setStyleSheet("background-color: black; border-radius: 8px;")
-        live_layout.addWidget(self.video_widget)
+        self.video_container_layout.addWidget(self.video_widget)
+        
+        # Status Overlay
+        self.status_overlay = QLabel("Loading...")
+        self.status_overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_overlay.setStyleSheet("background-color: rgba(0, 0, 0, 150); color: white; font-size: 18px; font-weight: bold; border-radius: 8px;")
+        self.status_overlay.setVisible(False)
+        self.video_container_layout.addWidget(self.status_overlay)
+        
+        live_layout.addWidget(self.video_container)
         
         # Playback Controls
         controls_layout = QHBoxLayout()
+        
+        self.btn_prev = QPushButton()
+        self.btn_prev.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaSkipBackward))
+        self.btn_prev.setToolTip("Previous Channel")
+        self.btn_prev.clicked.connect(self.prev_channel)
+        controls_layout.addWidget(self.btn_prev)
         
         self.btn_play_pause = QPushButton()
         self.btn_play_pause.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
@@ -799,6 +820,12 @@ class StreamPreviewDialog(QDialog):
         self.btn_stop.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaStop))
         self.btn_stop.clicked.connect(self.stop_playback)
         controls_layout.addWidget(self.btn_stop)
+        
+        self.btn_next = QPushButton()
+        self.btn_next.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaSkipForward))
+        self.btn_next.setToolTip("Next Channel")
+        self.btn_next.clicked.connect(self.next_channel)
+        controls_layout.addWidget(self.btn_next)
         
         controls_layout.addStretch()
         
@@ -824,19 +851,21 @@ class StreamPreviewDialog(QDialog):
         live_layout.addLayout(controls_layout)
         
         # Stream Info
-        info_group = QGroupBox("Stream Information")
-        info_layout = QFormLayout(info_group)
-        info_layout.addRow("Name:", QLabel(entry.name))
-        info_layout.addRow("Group:", QLabel(entry.group))
-        url_lbl = QLabel(entry.url)
-        url_lbl.setWordWrap(True)
-        info_layout.addRow("URL:", url_lbl)
-        live_layout.addWidget(info_group)
+        self.info_group = QGroupBox("Stream Information")
+        self.info_layout = QFormLayout(self.info_group)
+        self.lbl_name = QLabel(self.entry.name)
+        self.lbl_group = QLabel(self.entry.group)
+        self.lbl_url = QLabel(self.entry.url)
+        self.lbl_url.setWordWrap(True)
+        self.info_layout.addRow("Name:", self.lbl_name)
+        self.info_layout.addRow("Group:", self.lbl_group)
+        self.info_layout.addRow("URL:", self.lbl_url)
+        live_layout.addWidget(self.info_group)
         
         self.tabs.addTab(self.live_tab, "Live Preview")
         
         # --- Storyboard Tab ---
-        self.storyboard_widget = StoryboardWidget(entry.url)
+        self.storyboard_widget = StoryboardWidget(self.entry.url)
         self.tabs.addTab(self.storyboard_widget, "Storyboard")
         
         # Media Player Setup
@@ -847,22 +876,73 @@ class StreamPreviewDialog(QDialog):
         self.audio_output.setVolume(0.7)
         
         self.player.errorOccurred.connect(self.handle_error)
+        self.player.playbackStateChanged.connect(self.on_playback_state_changed)
+        self.player.mediaStatusChanged.connect(self.on_media_status_changed)
         
         # Start Playback
-        self.player.setSource(QUrl(entry.url))
+        self.load_entry(self.current_index)
+
+    def load_entry(self, index):
+        if not (0 <= index < len(self.entries)):
+            return
+            
+        self.current_index = index
+        self.entry = self.entries[self.current_index]
+        
+        self.setWindowTitle(f"Preview: {self.entry.name}")
+        self.lbl_name.setText(self.entry.name)
+        self.lbl_group.setText(self.entry.group)
+        self.lbl_url.setText(self.entry.url)
+        
+        # Update Storyboard widget
+        self.storyboard_widget.url = self.entry.url
+        self.storyboard_widget.status_lbl.setText("Ready to generate storyboard.")
+        
+        self.status_overlay.setText("Loading Stream...")
+        self.status_overlay.setVisible(True)
+        self.video_widget.setVisible(False)
+        
+        self.player.stop()
+        self.player.setSource(QUrl(self.entry.url))
         self.player.play()
+        
+        # Update button states
+        self.btn_prev.setEnabled(self.current_index > 0)
+        self.btn_next.setEnabled(self.current_index < len(self.entries) - 1)
+
+    def prev_channel(self):
+        self.load_entry(self.current_index - 1)
+
+    def next_channel(self):
+        self.load_entry(self.current_index + 1)
+
+    def on_playback_state_changed(self, state):
+        if state == QMediaPlayer.PlaybackState.PlayingState:
+            self.btn_play_pause.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
+        else:
+            self.btn_play_pause.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+
+    def on_media_status_changed(self, status):
+        if status == QMediaPlayer.MediaStatus.BufferedMedia or status == QMediaPlayer.MediaStatus.LoadedMedia:
+            self.status_overlay.setVisible(False)
+            self.video_widget.setVisible(True)
+        elif status == QMediaPlayer.MediaStatus.LoadingMedia or status == QMediaPlayer.MediaStatus.StalledMedia:
+            self.status_overlay.setText("Buffering...")
+            self.status_overlay.setVisible(True)
+            self.video_widget.setVisible(False)
+        elif status == QMediaPlayer.MediaStatus.InvalidMedia:
+            self.status_overlay.setText("Error: Invalid Stream")
+            self.status_overlay.setVisible(True)
+            self.video_widget.setVisible(False)
 
     def toggle_playback(self):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
-            self.btn_play_pause.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
         else:
             self.player.play()
-            self.btn_play_pause.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
 
     def stop_playback(self):
         self.player.stop()
-        self.btn_play_pause.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
 
     def set_volume(self, value):
         self.audio_output.setVolume(value / 100.0)
@@ -882,80 +962,21 @@ class StreamPreviewDialog(QDialog):
     def toggle_fullscreen(self):
         if self.video_widget.isFullScreen():
             self.video_widget.showNormal()
+            self.btn_fullscreen.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TitleBarMaxButton))
         else:
             self.video_widget.showFullScreen()
+            self.btn_fullscreen.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TitleBarNormalButton))
 
     def handle_error(self, error, error_str):
-        QMessageBox.critical(self, "Playback Error", f"Could not play stream:\n{error_str}")
+        self.status_overlay.setText(f"Error: {error_str}")
+        self.status_overlay.setVisible(True)
+        self.video_widget.setVisible(False)
+        logging.error(f"Playback error: {error_str}")
 
     def closeEvent(self, event):
         self.player.stop()
         self.storyboard_widget.cleanup()
         super().closeEvent(event)
-
-class SaveOptionsDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Save Options")
-        layout = QVBoxLayout(self)
-        self.combo = QComboBox()
-        self.combo.addItems(["utf-8", "utf-8-sig", "latin-1", "cp1252"])
-        layout.addWidget(QLabel("Select Encoding:"))
-        layout.addWidget(self.combo)
-        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-        layout.addWidget(btns)
-
-    def get_encoding(self):
-        return self.combo.currentText()
-
-class FindReplaceDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Find and Replace")
-        layout = QFormLayout(self)
-        self.find_input = QLineEdit()
-        self.replace_input = QLineEdit()
-        self.field_combo = QComboBox()
-        self.field_combo.addItems(["Name", "Group", "URL", "Logo", "Tvg-ID", "Tvg-Chno", "User-Agent"])
-        self.case_check = QCheckBox("Case Sensitive")
-        layout.addRow("Find:", self.find_input)
-        layout.addRow("Replace:", self.replace_input)
-        layout.addRow("Field:", self.field_combo)
-        layout.addRow(self.case_check)
-        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-        layout.addWidget(btns)
-
-    def get_data(self):
-        return (self.find_input.text(), self.replace_input.text(), 
-                self.field_combo.currentText(), self.case_check.isChecked())
-
-class ChannelNumberingDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Channel Numbering")
-        layout = QFormLayout(self)
-        self.start_spin = QSpinBox()
-        self.start_spin.setRange(1, 99999)
-        self.sort_check = QCheckBox("Sort by Group/Name first")
-        self.reset_check = QCheckBox("Reset numbering per group")
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["Update tvg-chno", "Prefix Name (e.g. 1. Name)"])
-        layout.addRow("Start Number:", self.start_spin)
-        layout.addRow(self.sort_check)
-        layout.addRow(self.reset_check)
-        layout.addRow("Target Mode:", self.mode_combo)
-        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-        layout.addWidget(btns)
-
-    def get_settings(self):
-        return (self.start_spin.value(), self.sort_check.isChecked(), 
-                self.reset_check.isChecked(), self.mode_combo.currentIndex())
 
 class ManageGroupsDialog(QDialog):
     """Dialog to add, rename, and delete groups across the entire playlist."""
@@ -2968,15 +2989,20 @@ class M3UEditorWindow(QMainWindow):
             QMessageBox.warning(self, "Error", f"Could not start VLC: {e}\nEnsure VLC is installed and in your PATH.")
 
     def open_stream_preview(self):
-        selected_indices = self.get_selected_rows()
-        if not selected_indices:
+        selected_rows = self.table.selectionModel().selectedRows()
+        if not selected_rows:
             return
             
-        proxy_index = selected_indices[0]
-        source_index = self.proxy_model.mapToSource(proxy_index)
-        entry = self.entries[source_index.row()]
+        # Get all entries from the proxy model (the ones currently visible/sorted)
+        visible_entries = []
+        for i in range(self.proxy_model.rowCount()):
+            source_index = self.proxy_model.mapToSource(self.proxy_model.index(i, 0))
+            visible_entries.append(self.entries[source_index.row()])
+            
+        # Find the index of the selected row in the visible list
+        current_index = selected_rows[0].row()
         
-        dlg = StreamPreviewDialog(entry, self)
+        dlg = StreamPreviewDialog(visible_entries, current_index, self)
         dlg.exec()
 
     def open_statistics(self):
