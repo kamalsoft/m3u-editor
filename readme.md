@@ -1,29 +1,33 @@
 # Open Source M3U Editor
 
-A robust, cross-platform GUI application built with Python and PyQt6 for managing, editing, and organizing M3U/M3U8 playlists.
+A robust, cross-platform GUI application built with Python and PyQt6 for managing, editing, and organizing M3U/M3U8 playlists. Optimized for performance and security.
 
 ## Features
 
 *   **Playlist Management**: Load and save M3U playlists with support for standard `#EXTINF` metadata (Group, Logo, Name, Duration).
-*   **Load from URL**: Download and edit playlists directly from a web link.
-*   **Channel Editor**: Edit channel names, groups, logos, and stream URLs in a dedicated side panel.
-*   **Organization**:
+*   **Load from URL**: Download and edit playlists directly from a web link with a dedicated **Reload** button for quick refreshes.
+*   **Performance Optimized**:
+    *   **Fast Parsing**: High-performance M3U parser for near-instant loading of large playlists.
+    *   **Efficient Undo/Redo**: Delta-based undo system reduces memory overhead.
+    *   **Throttled Logo Loading**: Background logo fetching with targeted UI updates for smooth scrolling.
+*   **Enhanced Stream Preview**:
+    *   **Live Playback**: Interactive video preview with full playback controls (Play/Pause, Stop, Volume, Fullscreen).
+    *   **Navigation**: Browse through channels directly within the preview window using Next/Previous buttons.
+    *   **Integrated Storyboard**: Generate and view frame-by-frame storyboards of your streams.
+    *   **Live Editing**: Edit the channel's group directly from the preview screen with real-time synchronization.
+*   **Stream Security Audit**:
+    *   **Comprehensive Scanning**: Audit streams for SSL/TLS validity, content-type correctness, and suspicious redirects.
+    *   **Reputation Check**: Identify streams from known malicious or low-reputation domains.
+    *   **Visual Indicators**: Color-coded security status (Green Shield for secure, Warning for insecure) with detailed tooltips.
+*   **Smart Organization**:
+    *   **Advanced Smart Grouping**: Regex-based categorization with resolution (4K, HD, SD) and country detection.
+    *   **Manage Groups**: Dedicated dialog to bulk rename, add, or delete groups across the entire playlist.
     *   **Drag and Drop**: Reorder channels easily by dragging rows.
-    *   **Move Up/Down**: dedicated buttons for precise reordering.
-    *   **Bulk Edit**: Select multiple rows to batch update the "Group" title.
-*   **Stream Validation**:
-    *   **Health Check**: Validates stream URLs via asynchronous HTTP HEAD requests.
-    *   **Visual Feedback**: Rows turn Green (Valid) or Red (Invalid).
-    *   **Cleanup**: "Remove Invalid" button to automatically delete dead streams.
-*   **Duplicate Finder**: Identify and highlight channels with duplicate URLs.
-*   **Video Preview**: Integrated video player to preview streams directly within the app (supports formats supported by the OS backend).
-*   **External Player**: Open streams in VLC via right-click context menu.
-*   **Search & Filter**: 
-    *   Real-time filter bar to find channels by name.
-    *   Dropdown menu to filter by specific groups.
-*   **Undo/Redo**: Revert accidental changes using `Ctrl+Z` and re-apply them with `Ctrl+Y`.
-*   **Export**: Export your playlist to CSV format for external analysis.
-*   **Dark Mode**: Toggle between Light and Dark themes.
+    *   **Context Menu**: Quick "Edit Group" and "Open in VLC" actions.
+*   **Health Check**: Validate stream URLs via asynchronous HTTP HEAD requests with granular feedback.
+*   **Search & Filter**: Real-time search and group-based filtering.
+*   **Export**: Export playlists to CSV format.
+*   **Dark Mode**: Sleek, modern dark theme for reduced eye strain.
 
 ## Demo
 
@@ -34,6 +38,7 @@ A robust, cross-platform GUI application built with Python and PyQt6 for managin
 
 *   Python 3.x
 *   PyQt6
+*   VLC (Optional, for external playback)
 
 ## Installation
 
@@ -53,23 +58,27 @@ pip install PyQt6
     python m3u_editor.py
     ```
 2.  **Load**: 
-    *   Click **Load M3U** to open a local playlist file.
-    *   Click **Load URL** to import a playlist from a web address.
-3.  **Edit**: Select a channel to modify its details in the right panel. Changes are reflected immediately.
-4.  **Organize**: Use the "Organize" buttons or drag-and-drop to rearrange channels.
-5.  **Filter**: Use the search bar or the Group dropdown to find specific channels.
-6.  **Validate**: Click **Check Stream Health** to verify URLs. Once finished, you can use **Remove Invalid** to clean up.
-7.  **Play**: 
-    *   Use the built-in preview panel.
-    *   Right-click a row and select **Open in VLC** (configure VLC path in **Settings**).
-8.  **Save**: Click **Save M3U** to write your changes to a file.
+    *   Click **Load M3U** for local files or **Load URL** for web playlists.
+    *   Use the **Reload** button to refresh the current source.
+3.  **Edit**: Select a channel to modify its details in the right panel, or edit the **Group** directly in the **Stream Preview**.
+4.  **Security Audit**: Click **Security Audit** in the toolbar to scan selected or all streams for potential threats.
+5.  **Smart Grouping**: Use the **Smart Grouping** feature to automatically categorize channels based on their names.
+6.  **Manage Groups**: Use the **Manage Groups** button to perform bulk group operations.
+7.  **Save**: Click the **Save** button (enabled when changes are made to local files) to persist your work. Modified files are marked with an asterisk (*) in the title bar.
+
+## Security & Privacy
+
+This application prioritizes your security:
+- **SSL Validation**: Flags insecure HTTP streams.
+- **Content Verification**: Ensures streams are genuine media and not malicious scripts.
+- **Local Processing**: Your playlist data stays on your machine.
 
 ## Roadmap
 
-*   **Batch Rename**: Regex-based search and replace for channel names.
-*   **Favorites**: Quick access to frequently used channels.
-*   **EPG Integration**: Support for XMLTV files to show program guides.
 *   **Xtream Codes**: Login support for IPTV providers.
+*   **EPG Integration**: Support for XMLTV files to show program guides.
+*   **Favorites**: Quick access to frequently used channels.
+*   **Batch Rename**: Regex-based search and replace for channel names.
 
 ## License
 
@@ -77,25 +86,15 @@ Distributed under the MIT License. See `LICENSE` for more information.
 
 ## Disclaimer
 
-This software is provided "as is", without warranty of any kind, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose and noninfringement. In no event shall the authors or copyright holders be liable for any claim, damages or other liability, whether in an action of contract, tort or otherwise, arising from, out of or in connection with the software or the use or other dealings in the software.
+This software is provided "as is", without warranty of any kind. Users are responsible for ensuring they have the legal right to access the streams they use.
 
 ## Author
 
-Created and maintained by Kamal. Reach me at kamalsoft@gmail.com for more development opportunities.
+Created and maintained  Reach me  for more development opportunities.
 
 ## Contributing
 
-Contributions are what make the open source community such an amazing place to learn, inspire, and create. Any contributions you make are **greatly appreciated**.
-
-1.  Fork the Project
-2.  Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
-3.  Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
-4.  Push to the Branch (`git push origin feature/AmazingFeature`)
-5.  Open a Pull Request
-
-## Fair Usage Policy
-
-This tool is designed for managing personal M3U playlists. Users are responsible for ensuring they have the legal right to access and use the streams contained within their playlists. The developers of this application do not endorse or support copyright infringement or the use of illegal IPTV services. Please respect content creators and rights holders.
+Contributions are welcome! Please feel free to submit a Pull Request.
 
 ---
 
