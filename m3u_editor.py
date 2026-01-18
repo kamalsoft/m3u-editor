@@ -21,6 +21,7 @@ from datetime import datetime
 import hashlib
 import socket
 import shutil
+import random
 
 try:
     import pychromecast
@@ -35,7 +36,7 @@ from performance_utils import ThrottledLogoLoader, EfficientUndoStack, FastM3UPa
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTableView, QPushButton, QLabel, QLineEdit,
-    QFileDialog, QMessageBox, QHeaderView, QSplitter, QGroupBox, QFormLayout,
+    QFileDialog, QMessageBox, QHeaderView, QSplitter, QGroupBox, QFormLayout, QColorDialog,
     QInputDialog, QAbstractItemView, QProgressBar, QGraphicsOpacityEffect, QDateTimeEdit,
     QMenu, QComboBox, QDialog, QDialogButtonBox, QCheckBox, QTabWidget,
     QListView, QStackedWidget, QSpinBox, QTextEdit, QTableWidget, QTableWidgetItem, QDockWidget, QRadioButton, QScrollArea, QGridLayout,
@@ -44,8 +45,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QUrl, QPropertyAnimation, 
                           QEasingCurve, QAbstractAnimation, QSettings, QAbstractTableModel,
                           QSortFilterProxyModel, QThreadPool, QRunnable, QObject, QByteArray, QSize, QTimer,
-                          QDateTime, QPoint)
-from PyQt6.QtGui import QColor, QPalette, QAction, QPixmap, QIcon, QImage, QStandardItemModel, QStandardItem
+                          QDateTime, QPoint, QRect)
+from PyQt6.QtGui import QColor, QPalette, QAction, QPixmap, QIcon, QImage, QStandardItemModel, QStandardItem, QPainter, QBrush
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink, QMediaMetaData
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 
@@ -1186,7 +1187,7 @@ class CastManagerDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Cast Manager")
-        self.resize(350, 180)
+        self.resize(400, 400)
         self.parent_window = parent
         
         layout = QVBoxLayout(self)
@@ -1208,6 +1209,34 @@ class CastManagerDialog(QDialog):
         url_lbl.setWordWrap(True)
         layout.addWidget(url_lbl)
         
+        # Volume Control
+        vol_layout = QHBoxLayout()
+        vol_layout.addWidget(QLabel("Volume:"))
+        self.vol_slider = QSlider(Qt.Orientation.Horizontal)
+        self.vol_slider.setRange(0, 100)
+        try:
+            # pychromecast volume is 0.0-1.0
+            current_vol = cast.status.volume_level
+            self.vol_slider.setValue(int(current_vol * 100))
+        except Exception:
+            self.vol_slider.setValue(50)
+        self.vol_slider.valueChanged.connect(self.set_volume)
+        vol_layout.addWidget(self.vol_slider)
+        layout.addLayout(vol_layout)
+
+        # Queue Management
+        layout.addWidget(QLabel("Cast Queue:"))
+        self.queue_list = QListWidget()
+        self.refresh_queue()
+        layout.addWidget(self.queue_list)
+        
+        q_btn_layout = QHBoxLayout()
+        btn_remove_q = QPushButton("Remove Selected")
+        btn_remove_q.clicked.connect(self.remove_queue_item)
+        q_btn_layout.addWidget(btn_remove_q)
+        q_btn_layout.addStretch()
+        layout.addLayout(q_btn_layout)
+        
         btn_layout = QHBoxLayout()
         
         btn_restart = QPushButton("Restart Media")
@@ -1223,6 +1252,25 @@ class CastManagerDialog(QDialog):
         btn_close = QPushButton("Close")
         btn_close.clicked.connect(self.accept)
         layout.addWidget(btn_close)
+
+    def set_volume(self, value):
+        if self.parent_window and self.parent_window.active_cast:
+            try:
+                self.parent_window.active_cast.set_volume(value / 100.0)
+            except Exception:
+                pass
+
+    def refresh_queue(self):
+        self.queue_list.clear()
+        if self.parent_window:
+            for entry in self.parent_window.cast_queue:
+                self.queue_list.addItem(entry.name)
+
+    def remove_queue_item(self):
+        row = self.queue_list.currentRow()
+        if row >= 0 and self.parent_window:
+            self.parent_window.cast_queue.pop(row)
+            self.refresh_queue()
 
     def restart_cast(self):
         if self.parent_window and self.parent_window.active_cast:
@@ -1242,6 +1290,8 @@ class CastManagerDialog(QDialog):
                 self.parent_window.active_cast.quit_app()
                 self.parent_window.active_cast = None
                 self.parent_window.active_cast_url = None
+                self.parent_window.active_cast_stream_name = None
+                self.parent_window.cast_poll_timer.stop()
                 QMessageBox.information(self, "Success", "Casting stopped.")
                 self.accept()
             except Exception as e:
@@ -1283,6 +1333,10 @@ class CastDialog(QDialog):
         btn_layout.addWidget(btn_cancel)
         layout.addLayout(btn_layout)
         
+        # Confetti Overlay
+        self.confetti = ConfettiWidget(self)
+        self.confetti.hide()
+        
         # Start scan after a brief delay to allow UI to show
         QTimer.singleShot(100, self.scan_devices)
 
@@ -1308,6 +1362,10 @@ class CastDialog(QDialog):
         count = self.device_list.count()
         self.status_lbl.setText(f"Scan complete. Found {count} devices.")
 
+    def resizeEvent(self, event):
+        self.confetti.resize(self.size())
+        super().resizeEvent(event)
+
     def start_casting(self):
         item = self.device_list.currentItem()
         if not item: return
@@ -1317,26 +1375,38 @@ class CastDialog(QDialog):
         
         if cast:
             self.status_lbl.setText(f"Connecting to {name}...")
-            QApplication.processEvents()
-            try:
-                cast.wait()
-                mc = cast.media_controller
-                mc.play_media(self.url, 'video/mp4')
-                mc.block_until_active()
-                
-                # Store active cast in root window (M3UEditorWindow)
-                root = self.parent()
-                while root and not hasattr(root, 'thread_pool'): # Heuristic to find M3UEditorWindow
-                    root = root.parent()
-                if root:
-                    root.active_cast = cast
-                    root.active_cast_url = self.url
-                
-                QMessageBox.information(self, "Success", f"Casting started on {name}")
-                self.accept()
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to cast: {str(e)}")
-                self.status_lbl.setText("Error connecting.")
+            self.btn_cast.setEnabled(False)
+            self.btn_stop.setEnabled(False)
+            self.device_list.setEnabled(False)
+            
+            # Start Confetti
+            self.confetti.start()
+            
+            worker = CastConnectWorker(cast, self.url)
+            worker.signals.success.connect(lambda: self.on_cast_success(cast, name))
+            worker.signals.error.connect(self.on_cast_error)
+            QThreadPool.globalInstance().start(worker)
+
+    def on_cast_success(self, cast, name):
+        # Store active cast in root window (M3UEditorWindow)
+        root = self.parent()
+        while root and not hasattr(root, 'thread_pool'): # Heuristic to find M3UEditorWindow
+            root = root.parent()
+        if root:
+            root.active_cast = cast
+            root.active_cast_url = self.url
+            root.active_cast_stream_name = self.stream_name
+            root.start_cast_monitoring()
+        
+        self.confetti.stop()
+        self.accept()
+
+    def on_cast_error(self, error_msg):
+        self.confetti.stop()
+        self.btn_cast.setEnabled(True)
+        self.device_list.setEnabled(True)
+        QMessageBox.critical(self, "Error", f"Failed to cast: {error_msg}")
+        self.status_lbl.setText("Error connecting.")
 
     def stop_casting(self):
         # Find root window
@@ -1347,6 +1417,7 @@ class CastDialog(QDialog):
             root.active_cast.quit_app()
             root.active_cast = None
             root.active_cast_url = None
+            root.cast_poll_timer.stop()
             self.accept()
 
 class SmartDedupeDialog(QDialog):
@@ -1890,7 +1961,7 @@ class StreamPreviewDialog(QDialog):
                 QTimer.singleShot(1500, lambda: self.status_overlay.setVisible(False))
 
     def open_cast_dialog(self):
-        dlg = CastDialog(self.entry.url, self)
+        dlg = CastDialog(self.entry.url, self, stream_name=self.entry.name)
         dlg.exec()
 
     def copy_url_to_clipboard(self):
@@ -2607,6 +2678,131 @@ class LogoWizardWorker(QRunnable):
             self.signals.progress.emit(int(((i + 1) / total) * 100))
         self.signals.finished.emit(found_count)
 
+class ThemeEditorDialog(QDialog):
+    def __init__(self, current_theme, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Theme Editor")
+        self.resize(400, 500)
+        self.theme = current_theme.copy()
+        self.layout = QVBoxLayout(self)
+        
+        self.form = QFormLayout()
+        self.color_buttons = {}
+        
+        labels = {
+            'window': "Window Background",
+            'text': "Text Color",
+            'button': "Button Background",
+            'button_text': "Button Text",
+            'border': "Border Color",
+            'highlight': "Highlight/Accent",
+            'input': "Input Background"
+        }
+        
+        for key, label in labels.items():
+            btn = QPushButton()
+            btn.setStyleSheet(f"background-color: {self.theme.get(key, '#000000')}; border: 1px solid #888;")
+            btn.clicked.connect(lambda checked, k=key, b=btn: self.pick_color(k, b))
+            self.color_buttons[key] = btn
+            self.form.addRow(label, btn)
+            
+        self.layout.addLayout(self.form)
+        
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Apply)
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        btn_box.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(self.apply_preview)
+        self.layout.addWidget(btn_box)
+
+    def pick_color(self, key, btn):
+        color = QColorDialog.getColor(QColor(self.theme.get(key, "#000000")), self, "Select Color")
+        if color.isValid():
+            hex_color = color.name()
+            self.theme[key] = hex_color
+            btn.setStyleSheet(f"background-color: {hex_color}; border: 1px solid #888;")
+
+    def apply_preview(self):
+        if self.parent():
+            self.parent().apply_theme(self.theme)
+            
+    def get_theme(self):
+        return self.theme
+
+class CastStatusWidget(QWidget):
+    """Mini player for the status bar."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(5)
+        
+        self.lbl_status = QLabel("Casting:")
+        self.lbl_status.setStyleSheet("font-weight: bold; color: #89b4fa;")
+        
+        self.btn_play_pause = QPushButton()
+        self.btn_play_pause.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
+        self.btn_play_pause.setFixedSize(24, 24)
+        self.btn_play_pause.setToolTip("Play/Pause Cast")
+        
+        self.btn_stop = QPushButton()
+        self.btn_stop.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaStop))
+        self.btn_stop.setFixedSize(24, 24)
+        self.btn_stop.setToolTip("Stop Casting")
+        
+        layout.addWidget(self.lbl_status)
+        layout.addWidget(self.btn_play_pause)
+        layout.addWidget(self.btn_stop)
+        
+    def update_state(self, is_playing, stream_name):
+        self.lbl_status.setText(f"Casting: {stream_name[:20]}..." if len(stream_name) > 20 else f"Casting: {stream_name}")
+        icon = QStyle.StandardPixmap.SP_MediaPause if is_playing else QStyle.StandardPixmap.SP_MediaPlay
+        self.btn_play_pause.setIcon(self.style().standardIcon(icon))
+
+class CastRemoteDock(QDockWidget):
+    """Remote control dock widget."""
+    def __init__(self, parent=None):
+        super().__init__("Cast Remote", parent)
+        self.setAllowedAreas(Qt.DockWidgetArea.TopDockWidgetArea | Qt.DockWidgetArea.BottomDockWidgetArea)
+        
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        
+        self.lbl_info = QLabel("No Media")
+        self.lbl_info.setStyleSheet("font-weight: bold; font-size: 12px;")
+        
+        self.btn_rewind = QPushButton("<< 30s")
+        self.btn_play = QPushButton("Play")
+        self.btn_stop = QPushButton("Stop")
+        self.btn_forward = QPushButton("30s >>")
+        
+        self.vol_slider = QSlider(Qt.Orientation.Horizontal)
+        self.vol_slider.setRange(0, 100)
+        self.vol_slider.setFixedWidth(100)
+        self.vol_slider.setToolTip("Cast Volume")
+        
+        layout.addWidget(self.lbl_info)
+        layout.addWidget(self.btn_rewind)
+        layout.addWidget(self.btn_play)
+        layout.addWidget(self.btn_stop)
+        layout.addWidget(self.btn_forward)
+        layout.addWidget(QLabel("Vol:"))
+        layout.addWidget(self.vol_slider)
+        layout.addStretch()
+        
+        self.setWidget(container)
+
+    def update_ui(self, status, stream_name):
+        self.lbl_info.setText(stream_name)
+        if status.player_state == 'PLAYING':
+            self.btn_play.setText("Pause")
+        else:
+            self.btn_play.setText("Play")
+        
+        # Update volume without triggering signal loop if possible
+        self.vol_slider.blockSignals(True)
+        self.vol_slider.setValue(int(status.volume_level * 100))
+        self.vol_slider.blockSignals(False)
+
 class FFmpegSignals(QObject):
     output = pyqtSignal(str)
     finished = pyqtSignal()
@@ -2731,6 +2927,17 @@ class ScheduledRecordingDialog(QDialog):
 # GUI Implementation
 # -----------------------------------------------------------------------------
 
+DEFAULT_THEME = {
+    'window': '#1e1e2e',
+    'text': '#cdd6f4',
+    'button': '#313244',
+    'button_text': '#cdd6f4',
+    'border': '#45475a',
+    'highlight': '#89b4fa',
+    'button_pressed': '#585b70',
+    'input': '#181825'
+}
+
 DARK_STYLESHEET = """
 /* Main Window & General */
 QMainWindow, QWidget { background-color: #1e1e2e; color: #cdd6f4; font-family: 'Segoe UI', sans-serif; font-size: 10pt; }
@@ -2792,6 +2999,71 @@ QScrollBar::handle:vertical { background: #45475a; min-height: 20px; border-radi
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
 """
 
+def generate_stylesheet(theme):
+    return f"""
+/* Main Window & General */
+QMainWindow, QWidget {{ background-color: {theme['window']}; color: {theme['text']}; font-family: 'Segoe UI', sans-serif; font-size: 10pt; }}
+
+/* Buttons */
+QPushButton {{
+    background-color: {theme['button']};
+    border: 2px solid {theme['border']};
+    border-radius: 8px;
+    padding: 8px 16px;
+    font-weight: 600;
+    color: {theme['button_text']};
+}}
+QPushButton:hover {{ background-color: {theme['border']}; border-color: {theme['highlight']}; color: {theme['highlight']}; }}
+QPushButton:pressed {{ background-color: {theme['button_pressed']}; }}
+QPushButton:disabled {{ background-color: {theme['window']}; border-color: {theme['button']}; color: #6c7086; }}
+
+/* Inputs */
+QLineEdit {{
+    background-color: {theme['input']};
+    border: 2px solid {theme['button']};
+    border-radius: 6px;
+    padding: 6px;
+    color: {theme['text']};
+}}
+QLineEdit:focus {{ border-color: {theme['highlight']}; }}
+
+/* Table */
+QTableView {{
+    background-color: {theme['input']};
+    alternate-background-color: {theme['window']};
+    border: 1px solid {theme['button']};
+    gridline-color: {theme['button']};
+    selection-background-color: {theme['button']};
+    selection-color: {theme['highlight']};
+    color: {theme['text']};
+}}
+QHeaderView::section {{
+    background-color: {theme['window']};
+    padding: 8px;
+    border: none;
+    border-bottom: 2px solid {theme['highlight']};
+    font-weight: bold;
+    color: {theme['text']};
+}}
+
+/* Group Box */
+QGroupBox {{
+    border: 2px solid {theme['button']};
+    border-radius: 8px;
+    margin-top: 1.5em;
+    font-weight: bold;
+}}
+QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 5px; color: {theme['highlight']}; }}
+
+/* Splitter */
+QSplitter::handle {{ background-color: {theme['button']}; }}
+
+/* Scrollbar */
+QScrollBar:vertical {{ border: none; background: {theme['input']}; width: 10px; margin: 0; }}
+QScrollBar::handle:vertical {{ background: {theme['border']}; min-height: 20px; border-radius: 5px; }}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}
+"""
+
 class M3UEditorWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2812,6 +3084,7 @@ class M3UEditorWindow(QMainWindow):
         self.is_modified = False
         self.editing_started = False
         self.is_dark_mode = True # Default to dark mode for "fancy" look
+        self.current_theme = DEFAULT_THEME.copy()
         self.settings = QSettings("OpenSource", "M3UEditor")
         self.recent_files = self.settings.value("recent_files", [], type=list)
         self.settings = QSettings("OpenSource", "M3UEditor")
@@ -2820,6 +3093,11 @@ class M3UEditorWindow(QMainWindow):
         # Migration from single url
         self.epg_url = ""
         old_url = self.settings.value("epg_url", "")
+        
+        # Load saved theme
+        saved_theme = self.settings.value("custom_theme", None)
+        if saved_theme:
+            self.current_theme = saved_theme
         if old_url and not self.epg_urls:
             self.epg_urls = [old_url]
         
@@ -2828,7 +3106,7 @@ class M3UEditorWindow(QMainWindow):
         self.audio_output = QAudioOutput()
         self.player.setAudioOutput(self.audio_output)
         
-        # Apply initial theme
+        # Apply initial theme (uses current_theme)
         self.toggle_theme(initial=True)
         
         # Performance Utils
@@ -2841,6 +3119,10 @@ class M3UEditorWindow(QMainWindow):
         self.scheduled_timers = [] # Keep references to timers
         self.active_cast = None # Currently connected Chromecast
         self.active_cast_url = None
+        self.active_cast_stream_name = None
+        self.cast_queue = []
+        self.cast_poll_timer = QTimer()
+        self.cast_poll_timer.timeout.connect(self.check_cast_status)
 
     def init_ui(self):
         # Main Layout
@@ -3116,6 +3398,23 @@ class M3UEditorWindow(QMainWindow):
         self.progress_bar.setFixedWidth(200)
         self.statusBar().addPermanentWidget(self.progress_bar)
         self.statusBar().addWidget(self.status_label)
+        
+        # Cast Status Widget (Mini Player)
+        self.cast_status_widget = CastStatusWidget()
+        self.cast_status_widget.setVisible(False)
+        self.cast_status_widget.btn_play_pause.clicked.connect(self.toggle_cast_playback)
+        self.cast_status_widget.btn_stop.clicked.connect(self.stop_cast_session)
+        self.statusBar().addPermanentWidget(self.cast_status_widget)
+        
+        # Cast Remote Dock
+        self.cast_remote = CastRemoteDock(self)
+        self.cast_remote.setVisible(False)
+        self.cast_remote.btn_play.clicked.connect(self.toggle_cast_playback)
+        self.cast_remote.btn_stop.clicked.connect(self.stop_cast_session)
+        self.cast_remote.btn_rewind.clicked.connect(lambda: self.seek_cast(-30))
+        self.cast_remote.btn_forward.clicked.connect(lambda: self.seek_cast(30))
+        self.cast_remote.vol_slider.valueChanged.connect(self.set_cast_volume)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.cast_remote)
 
     def create_menus(self):
         menubar = self.menuBar()
@@ -3293,6 +3592,10 @@ class M3UEditorWindow(QMainWindow):
         view_mode_action.setShortcut("Ctrl+G")
         view_mode_action.triggered.connect(self.toggle_view_mode)
         view_menu.addAction(view_mode_action)
+        
+        theme_editor_action = QAction("Theme Editor...", self)
+        theme_editor_action.triggered.connect(self.open_theme_editor)
+        view_menu.addAction(theme_editor_action)
         
         iptv_action = QAction("IPTV Player Mode", self)
         iptv_action.setShortcut("F11")
@@ -5071,15 +5374,27 @@ class M3UEditorWindow(QMainWindow):
 
     def toggle_theme(self, initial=False):
         app = QApplication.instance()
-        
         if not initial:
             self.is_dark_mode = not self.is_dark_mode
             
         if self.is_dark_mode:
-            app.setStyleSheet(DARK_STYLESHEET)
+            # Use current custom theme or default dark
+            app.setStyleSheet(generate_stylesheet(self.current_theme))
         else:
             app.setStyleSheet("") # Revert to default Fusion/System style
             app.setStyle("Fusion")
+
+    def open_theme_editor(self):
+        dlg = ThemeEditorDialog(self.current_theme, self)
+        if dlg.exec():
+            self.current_theme = dlg.get_theme()
+            self.settings.setValue("custom_theme", self.current_theme)
+            self.apply_theme(self.current_theme)
+            self.is_dark_mode = True # Force dark mode on apply
+
+    def apply_theme(self, theme):
+        app = QApplication.instance()
+        app.setStyleSheet(generate_stylesheet(theme))
 
     def toggle_view_mode(self):
         if self.view_stack.currentIndex() == 0:
@@ -5320,6 +5635,115 @@ class M3UEditorWindow(QMainWindow):
     def open_cast_manager(self):
         dlg = CastManagerDialog(self)
         dlg.exec()
+
+    def start_cast_monitoring(self):
+        """Starts polling the cast device status."""
+        self.cast_poll_timer.start(2000) # Check every 2 seconds
+
+    def check_cast_status(self):
+        if not self.active_cast:
+            self.cast_poll_timer.stop()
+            return
+            
+        self.update_cast_ui_state()
+        
+        if not HAS_CHROMECAST: return
+
+        try:
+            # Check if player is IDLE and we have a queue
+            mc = self.active_cast.media_controller
+            # Note: pychromecast updates status in background thread, accessing property is non-blocking
+            if mc.status.player_state == 'IDLE' and self.active_cast_url:
+                # Was playing (url set) and now IDLE -> finished
+                if self.cast_queue:
+                    self.play_next_cast()
+                else:
+                    self.active_cast_url = None # Queue finished
+                    self.status_label.setText("Casting finished.")
+            else:
+                # Update status bar with Now Playing
+                name = getattr(self, 'active_cast_stream_name', 'Unknown Stream')
+                self.status_label.setText(f"Casting: {name} on {self.active_cast.name}")
+        except Exception as e:
+            logging.error(f"Cast poll error: {e}")
+
+    def update_cast_ui_state(self):
+        """Updates the Mini Player and Remote Control UI."""
+        if self.active_cast and self.active_cast_url:
+            self.cast_status_widget.setVisible(True)
+            self.cast_remote.setVisible(True)
+            
+            name = getattr(self, 'active_cast_stream_name', 'Unknown')
+            status = self.active_cast.media_controller.status
+            is_playing = status.player_state == 'PLAYING'
+            
+            self.cast_status_widget.update_state(is_playing, name)
+            self.cast_remote.update_ui(status, name)
+        else:
+            self.cast_status_widget.setVisible(False)
+            self.cast_remote.setVisible(False)
+
+    def play_next_cast(self):
+        if not self.cast_queue or not self.active_cast: return
+        
+        entry = self.cast_queue.pop(0)
+        self.active_cast_url = entry.url
+        self.active_cast_stream_name = entry.name
+        try:
+            mc = self.active_cast.media_controller
+            mc.play_media(entry.url, 'video/mp4')
+            mc.block_until_active()
+            self.log_action(f"Auto-playing next in cast queue: {entry.name}")
+        except Exception as e:
+            logging.error(f"Failed to play next cast: {e}")
+            self.active_cast_url = None
+
+    def add_to_cast_queue(self):
+        selected_rows = self.get_selected_rows()
+        if not selected_rows: return
+        
+        count = 0
+        for idx in selected_rows:
+            source_index = self.proxy_model.mapToSource(idx)
+            entry = self.entries[source_index.row()]
+            self.cast_queue.append(entry)
+            count += 1
+            
+        self.log_action(f"Added {count} items to cast queue")
+        QMessageBox.information(self, "Cast Queue", f"Added {count} streams to queue.")
+        
+        # If casting is active but IDLE (nothing playing), start immediately
+        if self.active_cast and not self.active_cast_url:
+             try:
+                 if self.active_cast.media_controller.status.player_state == 'IDLE':
+                     self.play_next_cast()
+             except:
+                 pass
+
+    def toggle_cast_playback(self):
+        if self.active_cast:
+            mc = self.active_cast.media_controller
+            if mc.status.player_state == 'PLAYING':
+                mc.pause()
+            else:
+                mc.play()
+
+    def stop_cast_session(self):
+        if self.active_cast:
+            self.active_cast.quit_app()
+            self.active_cast = None
+            self.active_cast_url = None
+            self.active_cast_stream_name = None
+            self.cast_poll_timer.stop()
+            self.update_cast_ui_state()
+
+    def seek_cast(self, seconds):
+        if self.active_cast:
+            self.active_cast.media_controller.seek(self.active_cast.media_controller.status.current_time + seconds)
+
+    def set_cast_volume(self, value):
+        if self.active_cast:
+            self.active_cast.set_volume(value / 100.0)
 
 # -----------------------------------------------------------------------------
 # Main Execution
