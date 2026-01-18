@@ -23,6 +23,10 @@ import socket
 import shutil
 import random
 import json
+import http.cookiejar
+import importlib.util
+import warnings
+import io
 
 try:
     import pychromecast
@@ -30,7 +34,21 @@ try:
 except ImportError:
     HAS_CHROMECAST = False
 
+try:
+    import qrcode
+    HAS_QRCODE = True
+except ImportError:
+    HAS_QRCODE = False
+
 from dataclasses import dataclass
+
+# Suppress urllib3 SSL warnings on macOS/LibreSSL
+try:
+    from urllib3.exceptions import NotOpenSSLWarning
+    warnings.filterwarnings("ignore", category=NotOpenSSLWarning)
+except ImportError:
+    pass
+
 from typing import List, Optional, Iterable, Dict, Any
 from performance_utils import ThrottledLogoLoader, EfficientUndoStack, FastM3UParser
 
@@ -46,7 +64,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QUrl, QPropertyAnimation, 
                           QEasingCurve, QAbstractAnimation, QSettings, QAbstractTableModel,
                           QSortFilterProxyModel, QThreadPool, QRunnable, QObject, QByteArray, QSize, QTimer,
-                          QDateTime, QPoint, QRect)
+                          QDateTime, QPoint, QRect, QRectF, QTime, QItemSelection, QItemSelectionModel)
 from PyQt6.QtGui import QColor, QPalette, QAction, QPixmap, QIcon, QImage, QStandardItemModel, QStandardItem, QPainter, QBrush
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink, QMediaMetaData
 from PyQt6.QtMultimediaWidgets import QVideoWidget
@@ -452,6 +470,10 @@ class ResolutionWorker(QRunnable):
 
     def run(self):
         try:
+            if not shutil.which("ffprobe"):
+                self.signals.result.emit(self.row_index, "No ffprobe")
+                return
+
             res = self.get_resolution(self.url)
             if res:
                 self.signals.result.emit(self.row_index, res)
@@ -978,6 +1000,37 @@ class FindReplaceDialog(QDialog):
         return (self.find_input.text(), self.replace_input.text(), 
                 self.field_combo.currentText(), self.case_check.isChecked())
 
+class BatchRenameDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Batch Rename (Regex)")
+        self.resize(400, 250)
+        layout = QVBoxLayout(self)
+        
+        form = QFormLayout()
+        self.find_input = QLineEdit()
+        self.replace_input = QLineEdit()
+        self.chk_regex = QCheckBox("Use Regular Expressions")
+        self.chk_regex.setChecked(False)
+        self.chk_case = QCheckBox("Case Sensitive")
+        self.chk_case.setChecked(False)
+        
+        form.addRow("Find:", self.find_input)
+        form.addRow("Replace:", self.replace_input)
+        form.addRow("", self.chk_regex)
+        form.addRow("", self.chk_case)
+        
+        layout.addLayout(form)
+        
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+        
+    def get_data(self):
+        return (self.find_input.text(), self.replace_input.text(), 
+                self.chk_regex.isChecked(), self.chk_case.isChecked())
+
 class BulkEditDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1090,6 +1143,239 @@ class MergeStrategyDialog(QDialog):
         if self.rb_dedupe.isChecked(): return "dedupe"
         return "replace"
 
+class CloudSyncDialog(QDialog):
+    def __init__(self, settings, parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self.setWindowTitle("Cloud Sync (Drive/Dropbox)")
+        self.resize(450, 200)
+        layout = QVBoxLayout(self)
+        
+        layout.addWidget(QLabel("Sync with local cloud folder (Google Drive / Dropbox / OneDrive):"))
+        
+        path_layout = QHBoxLayout()
+        self.path_edit = QLineEdit(self.settings.value("cloud_sync_path", ""))
+        self.path_edit.setPlaceholderText("Select your local Cloud folder...")
+        btn_browse = QPushButton("Browse")
+        btn_browse.clicked.connect(self.browse_folder)
+        path_layout.addWidget(self.path_edit)
+        path_layout.addWidget(btn_browse)
+        layout.addLayout(path_layout)
+        
+        btn_layout = QHBoxLayout()
+        btn_upload = QPushButton("Upload (Save to Cloud)")
+        btn_upload.clicked.connect(self.upload)
+        btn_download = QPushButton("Download (Load from Cloud)")
+        btn_download.clicked.connect(self.download)
+        
+        btn_layout.addWidget(btn_upload)
+        btn_layout.addWidget(btn_download)
+        layout.addLayout(btn_layout)
+        
+        self.status_lbl = QLabel("")
+        self.status_lbl.setStyleSheet("color: #89b4fa;")
+        layout.addWidget(self.status_lbl)
+
+    def browse_folder(self):
+        d = QFileDialog.getExistingDirectory(self, "Select Cloud Folder")
+        if d:
+            self.path_edit.setText(d)
+            self.settings.setValue("cloud_sync_path", d)
+
+    def upload(self):
+        path = self.path_edit.text()
+        if self.parent():
+            self.parent().save_to_cloud(path)
+
+    def download(self):
+        path = self.path_edit.text()
+        if self.parent():
+            self.parent().load_from_cloud(path)
+
+class TaskSchedulerDialog(QDialog):
+    def __init__(self, settings, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Task Scheduler")
+        self.settings = settings
+        self.resize(400, 350)
+        layout = QVBoxLayout(self)
+        
+        # Auto Backup
+        gb_backup = QGroupBox("Auto Backup")
+        form_backup = QFormLayout(gb_backup)
+        self.chk_backup = QCheckBox("Enable Auto Backup")
+        self.spin_backup_interval = QSpinBox()
+        self.spin_backup_interval.setRange(1, 168) # 1 hour to 1 week
+        self.spin_backup_interval.setSuffix(" hours")
+        form_backup.addRow(self.chk_backup)
+        form_backup.addRow("Interval:", self.spin_backup_interval)
+        layout.addWidget(gb_backup)
+        
+        # Auto EPG
+        gb_epg = QGroupBox("Auto EPG Update")
+        form_epg = QFormLayout(gb_epg)
+        self.chk_epg = QCheckBox("Enable Auto EPG Update")
+        self.time_epg = QDateTimeEdit()
+        self.time_epg.setDisplayFormat("HH:mm")
+        form_epg.addRow(self.chk_epg)
+        form_epg.addRow("Daily at:", self.time_epg)
+        layout.addWidget(gb_epg)
+        
+        # Auto Validation
+        gb_val = QGroupBox("Auto Playlist Validation")
+        form_val = QFormLayout(gb_val)
+        self.chk_val = QCheckBox("Enable Auto Validation")
+        self.time_val = QDateTimeEdit()
+        self.time_val.setDisplayFormat("HH:mm")
+        form_val.addRow(self.chk_val)
+        form_val.addRow("Daily at:", self.time_val)
+        layout.addWidget(gb_val)
+        
+        self.load_settings()
+        
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.save_settings)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def load_settings(self):
+        self.chk_backup.setChecked(self.settings.value("scheduler/backup_enabled", False, type=bool))
+        self.spin_backup_interval.setValue(self.settings.value("scheduler/backup_interval", 24, type=int))
+        
+        self.chk_epg.setChecked(self.settings.value("scheduler/epg_enabled", False, type=bool))
+        epg_time = self.settings.value("scheduler/epg_time", QTime(3, 0)) # Default 3 AM
+        if not isinstance(epg_time, QTime): epg_time = QTime(3, 0)
+        self.time_epg.setTime(epg_time)
+        
+        self.chk_val.setChecked(self.settings.value("scheduler/val_enabled", False, type=bool))
+        val_time = self.settings.value("scheduler/val_time", QTime(4, 0)) # Default 4 AM
+        if not isinstance(val_time, QTime): val_time = QTime(4, 0)
+        self.time_val.setTime(val_time)
+
+    def save_settings(self):
+        self.settings.setValue("scheduler/backup_enabled", self.chk_backup.isChecked())
+        self.settings.setValue("scheduler/backup_interval", self.spin_backup_interval.value())
+        
+        self.settings.setValue("scheduler/epg_enabled", self.chk_epg.isChecked())
+        self.settings.setValue("scheduler/epg_time", self.time_epg.time())
+        
+        self.settings.setValue("scheduler/val_enabled", self.chk_val.isChecked())
+        self.settings.setValue("scheduler/val_time", self.time_val.time())
+        self.accept()
+
+class StalkerLoginDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Stalker Portal Login")
+        self.resize(400, 200)
+        layout = QVBoxLayout(self)
+        
+        form = QFormLayout()
+        self.url_edit = QLineEdit()
+        self.url_edit.setPlaceholderText("http://portal-url.com/c/")
+        self.mac_edit = QLineEdit()
+        self.mac_edit.setPlaceholderText("00:1A:79:XX:XX:XX")
+        
+        form.addRow("Portal URL:", self.url_edit)
+        form.addRow("MAC Address:", self.mac_edit)
+        layout.addLayout(form)
+        
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+        
+    def get_credentials(self):
+        url = self.url_edit.text().strip()
+        mac = self.mac_edit.text().strip()
+        if url and not url.startswith("http"):
+            url = "http://" + url
+        return url, mac
+
+class StalkerSignals(QObject):
+    finished = pyqtSignal(list) # list of M3UEntry
+    error = pyqtSignal(str)
+
+class StalkerWorker(QRunnable):
+    """Worker to fetch playlist from Stalker Portal."""
+    def __init__(self, portal_url, mac):
+        super().__init__()
+        self.portal_url = portal_url
+        self.mac = mac
+        self.signals = StalkerSignals()
+
+    def run(self):
+        try:
+            entries = self.fetch_channels()
+            self.signals.finished.emit(entries)
+        except Exception as e:
+            self.signals.error.emit(str(e))
+
+    def fetch_channels(self):
+        # Setup cookie jar
+        cj = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+        
+        # Common Stalker headers
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHTML, like Gecko) MAG200 stbapp ver: 2 rev: 250 Safari/533.3',
+            'Cookie': f'mac={self.mac}; stb_lang=en; timezone=Europe/London;',
+            'Referer': self.portal_url,
+            'Accept': '*/*'
+        }
+        
+        # Ensure URL ends with /server/load.php
+        base_api = self.portal_url.rstrip('/')
+        if not base_api.endswith('server/load.php'):
+            if base_api.endswith('/c'):
+                base_api += '/server/load.php'
+            else:
+                base_api += '/server/load.php'
+
+        def do_request(action, params=None):
+            if params is None: params = {}
+            params['action'] = action
+            query = urllib.parse.urlencode(params)
+            url = f"{base_api}?{query}"
+            req = urllib.request.Request(url, headers=headers)
+            with opener.open(req, timeout=15) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+
+        # 1. Handshake
+        logging.debug("Stalker: Handshake")
+        hs_data = do_request('handshake', {'type': 'stb', 'token': '', 'mac': self.mac})
+        if not hs_data or 'js' not in hs_data or 'token' not in hs_data['js']:
+            raise Exception("Handshake failed. Check MAC or URL.")
+        
+        token = hs_data['js']['token']
+        headers['Authorization'] = f'Bearer {token}'
+        
+        # 2. Get Profile (Optional but good for verification)
+        logging.debug("Stalker: Get Profile")
+        do_request('get_profile', {'type': 'stb'})
+        
+        # 3. Get All Channels
+        logging.debug("Stalker: Get Channels")
+        # type=itv is standard for TV channels
+        ch_data = do_request('get_all_channels', {'type': 'itv'})
+        
+        if 'js' not in ch_data or 'data' not in ch_data['js']:
+            raise Exception("Failed to retrieve channel list.")
+            
+        channels = ch_data['js']['data']
+        entries = []
+        
+        for ch in channels:
+            name = ch.get('name', 'Unknown')
+            cmd = ch.get('cmd', '')
+            # cmd often looks like "ffmpeg http://..." or "auto http://..."
+            url = re.sub(r'^(ffmpeg|auto|ffrt)\s+', '', cmd).strip()
+            logo = ch.get('logo', '')
+            # Construct entry
+            entries.append(M3UEntry(name=name, url=url, logo=logo, group="Stalker Import"))
+            
+        return entries
+
 class CastDiscoverySignals(QObject):
     found = pyqtSignal(object)
     finished = pyqtSignal()
@@ -1188,6 +1474,214 @@ class NetworkScannerDialog(QDialog):
         item = QListWidgetItem(f"{name}\n{location}")
         item.setData(Qt.ItemDataRole.UserRole, location)
         self.list_widget.addItem(item)
+
+class SnapshotGalleryDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Snapshot Gallery")
+        self.resize(800, 600)
+        self.snapshot_dir = os.path.join(os.getcwd(), "snapshots")
+        os.makedirs(self.snapshot_dir, exist_ok=True)
+        
+        layout = QVBoxLayout(self)
+        
+        self.list_widget = QListWidget()
+        self.list_widget.setViewMode(QListView.ViewMode.IconMode)
+        self.list_widget.setResizeMode(QListView.ResizeMode.Adjust)
+        self.list_widget.setIconSize(QSize(200, 112)) # 16:9 aspect ratio approx
+        self.list_widget.setSpacing(10)
+        self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        layout.addWidget(self.list_widget)
+        
+        btn_layout = QHBoxLayout()
+        btn_refresh = QPushButton("Refresh")
+        btn_refresh.clicked.connect(self.load_snapshots)
+        
+        btn_export = QPushButton("Export Selected...")
+        btn_export.clicked.connect(self.export_snapshots)
+        
+        btn_delete = QPushButton("Delete Selected")
+        btn_delete.clicked.connect(self.delete_snapshots)
+        
+        btn_open_folder = QPushButton("Open Folder")
+        btn_open_folder.clicked.connect(self.open_folder)
+        
+        btn_layout.addWidget(btn_refresh)
+        btn_layout.addWidget(btn_export)
+        btn_layout.addWidget(btn_delete)
+        btn_layout.addWidget(btn_open_folder)
+        btn_layout.addStretch()
+        
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.accept)
+        btn_layout.addWidget(btn_close)
+        
+        layout.addLayout(btn_layout)
+        
+        self.load_snapshots()
+
+    def load_snapshots(self):
+        self.list_widget.clear()
+        if not os.path.exists(self.snapshot_dir):
+            return
+            
+        files = sorted(glob.glob(os.path.join(self.snapshot_dir, "*.png")), key=os.path.getmtime, reverse=True)
+        for f in files:
+            item = QListWidgetItem(os.path.basename(f))
+            item.setIcon(QIcon(f))
+            item.setData(Qt.ItemDataRole.UserRole, f)
+            self.list_widget.addItem(item)
+
+    def delete_snapshots(self):
+        items = self.list_widget.selectedItems()
+        if not items: return
+        
+        if QMessageBox.question(self, "Confirm Delete", f"Delete {len(items)} snapshots?") != QMessageBox.StandardButton.Yes:
+            return
+            
+        for item in items:
+            path = item.data(Qt.ItemDataRole.UserRole)
+            try:
+                os.remove(path)
+            except Exception as e:
+                logging.error(f"Failed to delete {path}: {e}")
+        self.load_snapshots()
+
+    def export_snapshots(self):
+        items = self.list_widget.selectedItems()
+        if not items: return
+        
+        dest_dir = QFileDialog.getExistingDirectory(self, "Select Export Directory")
+        if not dest_dir: return
+        
+        count = 0
+        for item in items:
+            src = item.data(Qt.ItemDataRole.UserRole)
+            dst = os.path.join(dest_dir, os.path.basename(src))
+            try:
+                shutil.copy2(src, dst)
+                count += 1
+            except Exception as e:
+                logging.error(f"Failed to export {src}: {e}")
+        
+        QMessageBox.information(self, "Export", f"Exported {count} snapshots.")
+
+    def open_folder(self):
+        if sys.platform == 'win32':
+            os.startfile(self.snapshot_dir)
+        elif sys.platform == 'darwin':
+            subprocess.Popen(['open', self.snapshot_dir])
+        else:
+            subprocess.Popen(['xdg-open', self.snapshot_dir])
+
+class PlaylistDiffDialog(QDialog):
+    def __init__(self, current_entries, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Playlist Diff Tool")
+        self.resize(900, 600)
+        self.current_entries = current_entries
+        
+        layout = QVBoxLayout(self)
+        
+        top_layout = QHBoxLayout()
+        self.lbl_file = QLabel("No file selected")
+        btn_load = QPushButton("Load Comparison File...")
+        btn_load.clicked.connect(self.load_comparison_file)
+        top_layout.addWidget(btn_load)
+        top_layout.addWidget(self.lbl_file)
+        top_layout.addStretch()
+        layout.addLayout(top_layout)
+        
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["Status", "Name", "Group", "URL"])
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.table)
+        
+        self.lbl_stats = QLabel("")
+        layout.addWidget(self.lbl_stats)
+        
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        btn_box.rejected.connect(self.accept)
+        layout.addWidget(btn_box)
+
+    def load_comparison_file(self):
+        file_name, _ = QFileDialog.getOpenFileName(self, "Open M3U File", "", "M3U Files (*.m3u *.m3u8)")
+        if file_name:
+            self.lbl_file.setText(os.path.basename(file_name))
+            try:
+                new_entries = M3UParser.parse_file(file_name)
+                self.compare_playlists(new_entries)
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to load file: {e}")
+
+    def compare_playlists(self, new_entries):
+        self.table.setRowCount(0)
+        
+        # Map current by URL
+        curr_map = {e.url: e for e in self.current_entries}
+        new_map = {e.url: e for e in new_entries}
+        
+        added = []
+        removed = []
+        modified = []
+        
+        # Check for Added and Modified
+        for url, entry in new_map.items():
+            if url not in curr_map:
+                added.append(entry)
+            else:
+                curr_entry = curr_map[url]
+                # Check for modifications (Name, Group, Logo)
+                if (entry.name != curr_entry.name or 
+                    entry.group != curr_entry.group or 
+                    entry.logo != curr_entry.logo):
+                    modified.append((curr_entry, entry)) # (old, new)
+        
+        # Check for Removed
+        for url, entry in curr_map.items():
+            if url not in new_map:
+                removed.append(entry)
+                
+        # Populate Table
+        total_rows = len(added) + len(removed) + len(modified)
+        self.table.setRowCount(total_rows)
+        
+        row = 0
+        
+        # Added (Green)
+        for entry in added:
+            self.set_row(row, "Added", entry, QColor("#a6e3a1")) # Green
+            row += 1
+            
+        # Removed (Red)
+        for entry in removed:
+            self.set_row(row, "Removed", entry, QColor("#f38ba8")) # Red
+            row += 1
+            
+        # Modified (Yellow)
+        for old, new in modified:
+            self.set_row(row, "Modified", new, QColor("#f9e2af")) # Yellow
+            # Add tooltip showing changes
+            changes = []
+            if old.name != new.name: changes.append(f"Name: {old.name} -> {new.name}")
+            if old.group != new.group: changes.append(f"Group: {old.group} -> {new.group}")
+            if old.logo != new.logo: changes.append(f"Logo changed")
+            self.table.item(row, 0).setToolTip("\n".join(changes))
+            row += 1
+            
+        self.lbl_stats.setText(f"Added: {len(added)} | Removed: {len(removed)} | Modified: {len(modified)}")
+
+    def set_row(self, row, status, entry, color):
+        item_status = QTableWidgetItem(status)
+        item_status.setBackground(color)
+        item_status.setForeground(QColor("black")) # Ensure text is readable on colored bg
+        
+        self.table.setItem(row, 0, item_status)
+        self.table.setItem(row, 1, QTableWidgetItem(entry.name))
+        self.table.setItem(row, 2, QTableWidgetItem(entry.group))
+        self.table.setItem(row, 3, QTableWidgetItem(entry.url))
 
 class CastManagerDialog(QDialog):
     def __init__(self, parent=None):
@@ -1303,24 +1797,125 @@ class CastManagerDialog(QDialog):
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to stop: {e}")
 
+class ConfettiWidget(QWidget):
+    """Widget to display a confetti animation."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        self.particles = []
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_particles)
+        self.colors = [QColor("#f38ba8"), QColor("#fab387"), QColor("#f9e2af"), QColor("#a6e3a1"), QColor("#89b4fa"), QColor("#cba6f7")]
+
+    def start(self):
+        self.particles = []
+        for _ in range(60):
+            self.particles.append(self.create_particle(start_random_y=True))
+        self.timer.start(30)
+        self.show()
+        self.raise_()
+
+    def stop(self):
+        self.timer.stop()
+        self.hide()
+
+    def create_particle(self, start_random_y=False):
+        x = random.randint(0, self.width())
+        y = random.randint(0, self.height()) if start_random_y else -10
+        size = random.randint(4, 8)
+        color = random.choice(self.colors)
+        speed = random.randint(3, 8)
+        return {'x': x, 'y': y, 'size': size, 'color': color, 'speed': speed}
+
+    def update_particles(self):
+        for p in self.particles:
+            p['y'] += p['speed']
+            if p['y'] > self.height():
+                new_p = self.create_particle()
+                p.update(new_p)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        for p in self.particles:
+            painter.setBrush(QBrush(p['color']))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(p['x'], p['y'], p['size'], p['size'])
+
+class CastConnectSignals(QObject):
+    success = pyqtSignal()
+    error = pyqtSignal(str)
+
+class CastConnectWorker(QRunnable):
+    def __init__(self, cast, url):
+        super().__init__()
+        self.cast = cast
+        self.url = url
+        self.signals = CastConnectSignals()
+
+    def run(self):
+        try:
+            self.cast.wait()
+            mc = self.cast.media_controller
+            mc.play_media(self.url, 'video/mp4')
+            mc.block_until_active()
+            self.signals.success.emit()
+        except Exception as e:
+            self.signals.error.emit(str(e))
+
 class CastDialog(QDialog):
-    def __init__(self, url, parent=None):
+    def __init__(self, url, parent=None, stream_name="Unknown Stream"):
         super().__init__(parent)
         self.setWindowTitle("Cast Stream")
         self.url = url
-        self.resize(350, 250)
+        self.stream_name = stream_name
+        self.resize(400, 400)
         self.casts = {} # name -> cast_obj
         self.active_cast = getattr(parent, 'active_cast', None) if parent else None
         layout = QVBoxLayout(self)
         
-        layout.addWidget(QLabel("Scanning for Cast devices (Chromecast/DLNA)..."))
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+        
+        # --- Tab 1: Cast Devices ---
+        self.tab_devices = QWidget()
+        dev_layout = QVBoxLayout(self.tab_devices)
+        
+        self.lbl_scan_status = QLabel("Select a device:")
+        dev_layout.addWidget(self.lbl_scan_status)
         
         self.device_list = QListWidget()
-        layout.addWidget(self.device_list)
+        dev_layout.addWidget(self.device_list)
         
-        self.status_lbl = QLabel("Initializing...")
+        btn_rescan = QPushButton("Rescan Network")
+        btn_rescan.clicked.connect(self.start_scan)
+        dev_layout.addWidget(btn_rescan)
+        
+        self.tabs.addTab(self.tab_devices, "Chromecast / DLNA")
+        
+        # --- Tab 2: Mobile / WiFi ---
+        self.tab_mobile = QWidget()
+        mob_layout = QVBoxLayout(self.tab_mobile)
+        
+        mob_layout.addWidget(QLabel("Scan QR Code to play on mobile (WiFi):"))
+        self.qr_label = QLabel()
+        self.qr_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.qr_label.setMinimumSize(200, 200)
+        mob_layout.addWidget(self.qr_label)
+        self.generate_qr()
+        self.tabs.addTab(self.tab_mobile, "Mobile (QR)")
+        
+        # --- Bottom Controls ---
+        self.status_lbl = QLabel("Ready")
         self.status_lbl.setStyleSheet("color: #89b4fa;")
         layout.addWidget(self.status_lbl)
+        
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0) # Indeterminate
+        self.progress.setVisible(False)
+        layout.addWidget(self.progress)
         
         btn_layout = QHBoxLayout()
         self.btn_cast = QPushButton("Cast")
@@ -1331,7 +1926,7 @@ class CastDialog(QDialog):
         self.btn_stop.setEnabled(self.active_cast is not None)
         self.btn_stop.clicked.connect(self.stop_casting)
         
-        btn_cancel = QPushButton("Cancel")
+        btn_cancel = QPushButton("Close")
         btn_cancel.clicked.connect(self.reject)
         
         btn_layout.addWidget(self.btn_cast)
@@ -1343,8 +1938,42 @@ class CastDialog(QDialog):
         self.confetti = ConfettiWidget(self)
         self.confetti.hide()
         
-        # Start scan after a brief delay to allow UI to show
-        QTimer.singleShot(100, self.scan_devices)
+        # Initialize Devices
+        if self.active_cast:
+            self.casts[self.active_cast.name] = self.active_cast
+            item = QListWidgetItem(f"{self.active_cast.name} (Connected)")
+            self.device_list.addItem(item)
+            self.device_list.setCurrentItem(item)
+            self.btn_cast.setEnabled(True)
+            self.status_lbl.setText(f"Connected to {self.active_cast.name}")
+        else:
+            # Start scan after a brief delay to allow UI to show
+            QTimer.singleShot(100, self.start_scan)
+
+    def generate_qr(self):
+        if not HAS_QRCODE:
+            self.qr_label.setText("Install 'qrcode' library\nto generate QR codes.\npip install qrcode[pil]")
+            return
+            
+        try:
+            qr = qrcode.QRCode(version=1, box_size=10, border=4)
+            qr.add_data(self.url)
+            qr.make(fit=True)
+            img = qr.make_image(fill_color="black", back_color="white")
+            
+            # Convert to QPixmap
+            buffer = io.BytesIO()
+            img.save(buffer, format="PNG")
+            qimg = QImage.fromData(buffer.getvalue())
+            pixmap = QPixmap.fromImage(qimg)
+            
+            self.qr_label.setPixmap(pixmap.scaled(250, 250, Qt.AspectRatioMode.KeepAspectRatio))
+        except Exception as e:
+            self.qr_label.setText(f"Error: {e}")
+
+    def start_scan(self):
+        self.device_list.clear()
+        self.scan_devices()
 
     def scan_devices(self):
         if not HAS_CHROMECAST:
@@ -1362,11 +1991,20 @@ class CastDialog(QDialog):
         if cast.name not in self.casts:
             self.casts[cast.name] = cast
             self.device_list.addItem(cast.name)
-            self.btn_cast.setEnabled(True)
+            
+            # If this is the active cast (re-discovered), select it
+            if self.active_cast and cast.name == self.active_cast.name:
+                self.active_cast = cast # Update reference
+                items = self.device_list.findItems(cast.name, Qt.MatchFlag.MatchExactly)
+                if items:
+                    self.device_list.setCurrentItem(items[0])
+                    items[0].setText(f"{cast.name} (Connected)")
 
     def on_scan_finished(self):
         count = self.device_list.count()
         self.status_lbl.setText(f"Scan complete. Found {count} devices.")
+        if self.device_list.count() > 0:
+            self.btn_cast.setEnabled(True)
 
     def resizeEvent(self, event):
         self.confetti.resize(self.size())
@@ -1376,11 +2014,13 @@ class CastDialog(QDialog):
         item = self.device_list.currentItem()
         if not item: return
         
-        name = item.text()
+        # Handle "(Connected)" suffix
+        name = item.text().replace(" (Connected)", "")
         cast = self.casts.get(name)
         
         if cast:
             self.status_lbl.setText(f"Connecting to {name}...")
+            self.progress.setVisible(True)
             self.btn_cast.setEnabled(False)
             self.btn_stop.setEnabled(False)
             self.device_list.setEnabled(False)
@@ -1404,10 +2044,12 @@ class CastDialog(QDialog):
             root.active_cast_stream_name = self.stream_name
             root.start_cast_monitoring()
         
+        self.progress.setVisible(False)
         self.confetti.stop()
         self.accept()
 
     def on_cast_error(self, error_msg):
+        self.progress.setVisible(False)
         self.confetti.stop()
         self.btn_cast.setEnabled(True)
         self.device_list.setEnabled(True)
@@ -1959,12 +2601,14 @@ class StreamPreviewDialog(QDialog):
     def take_snapshot(self):
         pixmap = self.video_widget.grab()
         if not pixmap.isNull():
-            filename, _ = QFileDialog.getSaveFileName(self, "Save Snapshot", f"snapshot_{QDateTime.currentDateTime().toString('yyyyMMdd_HHmmss')}.png", "Images (*.png *.jpg)")
-            if filename:
-                pixmap.save(filename)
-                self.status_overlay.setText("Snapshot Saved")
-                self.status_overlay.setVisible(True)
-                QTimer.singleShot(1500, lambda: self.status_overlay.setVisible(False))
+            snapshot_dir = os.path.join(os.getcwd(), "snapshots")
+            os.makedirs(snapshot_dir, exist_ok=True)
+            filename = f"snapshot_{QDateTime.currentDateTime().toString('yyyyMMdd_HHmmss')}.png"
+            filepath = os.path.join(snapshot_dir, filename)
+            pixmap.save(filepath)
+            self.status_overlay.setText("Saved to Gallery")
+            self.status_overlay.setVisible(True)
+            QTimer.singleShot(1500, lambda: self.status_overlay.setVisible(False))
 
     def open_cast_dialog(self):
         dlg = CastDialog(self.entry.url, self, stream_name=self.entry.name)
@@ -2188,6 +2832,43 @@ class EPGSelectionDialog(QDialog):
             
         return urls
 
+class SimpleChartWidget(QWidget):
+    def __init__(self, data, parent=None):
+        super().__init__(parent)
+        self.data = data # dict {label: count}
+        self.setMinimumSize(200, 200)
+        self.colors = [
+            QColor("#e74c3c"), QColor("#8e44ad"), QColor("#3498db"), 
+            QColor("#2ecc71"), QColor("#f1c40f"), QColor("#e67e22"),
+            QColor("#1abc9c"), QColor("#34495e"), QColor("#95a5a6")
+        ]
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        rect = self.rect()
+        side = min(rect.width(), rect.height()) - 20
+        pie_rect = QRectF((rect.width() - side) / 2, (rect.height() - side) / 2, side, side)
+        
+        total = sum(self.data.values())
+        if total == 0: return
+        
+        start_angle = 90 * 16
+        sorted_items = sorted(self.data.items(), key=lambda x: x[1], reverse=True)
+        
+        # Limit slices to avoid clutter
+        if len(sorted_items) > 12:
+            sorted_items = sorted_items[:12]
+            
+        for i, (label, count) in enumerate(sorted_items):
+            span_angle = - (count / total) * 360 * 16
+            color = self.colors[i % len(self.colors)]
+            painter.setBrush(QBrush(color))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawPie(pie_rect, int(start_angle), int(span_angle))
+            start_angle += span_angle
+
 class StatisticsDialog(QDialog):
     def __init__(self, parent=None, entries=None, validation_data=None):
         super().__init__(parent)
@@ -2237,14 +2918,24 @@ class StatisticsDialog(QDialog):
             
         return table
 
+    def create_tab_content(self, data, headers):
+        widget = QWidget()
+        layout = QHBoxLayout(widget)
+        
+        table = self.create_table(data, headers)
+        chart = SimpleChartWidget(data)
+        
+        layout.addWidget(table, stretch=2)
+        layout.addWidget(chart, stretch=1)
+        return widget
+
     def create_group_tab(self):
         counts = {}
         for entry in self.entries:
             g = entry.group
             counts[g] = counts.get(g, 0) + 1
         
-        tab = self.create_table(counts, ["Group", "Count", "Distribution"])
-        self.tabs.addTab(tab, "Groups")
+        self.tabs.addTab(self.create_tab_content(counts, ["Group", "Count", "Distribution"]), "Groups")
 
     def create_resolution_tab(self):
         counts = {}
@@ -2255,8 +2946,7 @@ class StatisticsDialog(QDialog):
             res = match.group(1) if match else "Unknown"
             counts[res] = counts.get(res, 0) + 1
             
-        tab = self.create_table(counts, ["Resolution", "Count", "Distribution"])
-        self.tabs.addTab(tab, "Resolution")
+        self.tabs.addTab(self.create_tab_content(counts, ["Resolution", "Count", "Distribution"]), "Resolution")
 
     def create_health_tab(self):
         counts = {"Valid": 0, "Invalid": 0, "Untested": 0}
@@ -2275,8 +2965,7 @@ class StatisticsDialog(QDialog):
             else:
                 counts["Untested"] += 1
                 
-        tab = self.create_table(counts, ["Status", "Count", "Distribution"])
-        self.tabs.addTab(tab, "Health")
+        self.tabs.addTab(self.create_tab_content(counts, ["Status", "Count", "Distribution"]), "Health")
 
     def create_latency_tab(self):
         # Parse latencies from names (format: "Name [123ms]")
@@ -2511,13 +3200,16 @@ class IPTVPlayerWindow(QMainWindow):
     def take_snapshot(self):
         pixmap = self.video_widget.grab()
         if not pixmap.isNull():
-            filename, _ = QFileDialog.getSaveFileName(self, "Save Snapshot", f"snapshot_{QDateTime.currentDateTime().toString('yyyyMMdd_HHmmss')}.png", "Images (*.png *.jpg)")
-            if filename:
-                pixmap.save(filename)
-                self.statusBar().showMessage(f"Snapshot saved to {filename}", 3000)
+            snapshot_dir = os.path.join(os.getcwd(), "snapshots")
+            os.makedirs(snapshot_dir, exist_ok=True)
+            filename = f"snapshot_{QDateTime.currentDateTime().toString('yyyyMMdd_HHmmss')}.png"
+            filepath = os.path.join(snapshot_dir, filename)
+            pixmap.save(filepath)
+            self.statusBar().showMessage(f"Snapshot saved to Gallery: {filename}", 3000)
 
     def open_cast_dialog(self):
-        dlg = CastDialog(self.entries[self.current_index].url, self)
+        entry = self.entries[self.current_index]
+        dlg = CastDialog(entry.url, self, stream_name=entry.name)
         dlg.exec()
 
     def keyPressEvent(self, event):
@@ -2861,6 +3553,11 @@ class DiagnosticsWorker(QRunnable):
 
     def run(self):
         try:
+            if not shutil.which("ffprobe"):
+                self.signals.error.emit("ffprobe not found. Please install FFmpeg and add to PATH.")
+                self.signals.finished.emit()
+                return
+
             # Run ffprobe to get JSON output
             cmd = [
                 "ffprobe", "-v", "quiet", 
@@ -3066,6 +3763,44 @@ class CustomizeToolbarDialog(QDialog):
                 selected.append(item.data(Qt.ItemDataRole.UserRole))
         return selected
 
+class PluginManager:
+    def __init__(self, plugin_dir="plugins"):
+        self.plugin_dir = os.path.join(os.getcwd(), plugin_dir)
+        self.plugins = [] # List of dicts
+
+    def discover_plugins(self):
+        self.plugins = []
+        if not os.path.exists(self.plugin_dir):
+            try:
+                os.makedirs(self.plugin_dir)
+            except OSError:
+                pass 
+            return
+            
+        for filename in os.listdir(self.plugin_dir):
+            if filename.endswith(".py") and not filename.startswith("__"):
+                self.load_plugin(os.path.join(self.plugin_dir, filename))
+                
+    def load_plugin(self, filepath):
+        try:
+            name = os.path.basename(filepath)
+            module_name = os.path.splitext(name)[0]
+            spec = importlib.util.spec_from_file_location(module_name, filepath)
+            if spec and spec.loader:
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                
+                if hasattr(module, "run") and callable(module.run):
+                    plugin_name = getattr(module, "PLUGIN_NAME", module_name)
+                    self.plugins.append({
+                        "name": plugin_name,
+                        "module": module,
+                        "run": module.run
+                    })
+                    logging.info(f"Loaded plugin: {plugin_name}")
+        except Exception as e:
+            logging.error(f"Failed to load plugin {filepath}: {e}")
+
 # -----------------------------------------------------------------------------
 # GUI Implementation
 # -----------------------------------------------------------------------------
@@ -3081,9 +3816,17 @@ DEFAULT_THEME = {
     'input': '#181825'
 }
 
+# Determine font based on platform to avoid Qt warnings
+if sys.platform == "win32":
+    APP_FONT = "'Segoe UI', sans-serif"
+elif sys.platform == "darwin":
+    APP_FONT = "'Helvetica Neue', sans-serif"
+else:
+    APP_FONT = "sans-serif"
+
 DARK_STYLESHEET = """
 /* Main Window & General */
-QMainWindow, QWidget { background-color: #1e1e2e; color: #cdd6f4; font-family: 'Segoe UI', sans-serif; font-size: 10pt; }
+QMainWindow, QWidget { background-color: #1e1e2e; color: #cdd6f4; font-family: %FONT%; font-size: 10pt; }
 
 /* Buttons */
 QPushButton {
@@ -3140,12 +3883,12 @@ QSplitter::handle { background-color: #313244; }
 QScrollBar:vertical { border: none; background: #181825; width: 10px; margin: 0; }
 QScrollBar::handle:vertical { background: #45475a; min-height: 20px; border-radius: 5px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
-"""
+""".replace("%FONT%", APP_FONT)
 
 def generate_stylesheet(theme):
     return f"""
 /* Main Window & General */
-QMainWindow, QWidget {{ background-color: {theme['window']}; color: {theme['text']}; font-family: 'Segoe UI', sans-serif; font-size: 10pt; }}
+QMainWindow, QWidget {{ background-color: {theme['window']}; color: {theme['text']}; font-family: {APP_FONT}; font-size: 10pt; }}
 
 /* Buttons */
 QPushButton {{
@@ -3267,8 +4010,11 @@ class M3UEditorWindow(QMainWindow):
             "epg": {"label": "EPG", "icon": QStyle.StandardPixmap.SP_FileDialogDetailedView, "slot": self.prompt_epg_url, "tooltip": "Load EPG"},
             "settings": {"label": "Settings", "icon": QStyle.StandardPixmap.SP_FileDialogListView, "slot": self.open_settings, "tooltip": "Settings"},
             "theme": {"label": "Theme", "icon": QStyle.StandardPixmap.SP_DesktopIcon, "slot": lambda: self.toggle_theme(False), "tooltip": "Toggle Dark Mode"},
-            "iptv": {"label": "Player", "icon": QStyle.StandardPixmap.SP_MediaPlay, "slot": self.open_iptv_player, "tooltip": "IPTV Player Mode"}
+            "iptv": {"label": "Theater", "icon": QStyle.StandardPixmap.SP_MediaPlay, "slot": self.open_iptv_player, "tooltip": "Theater Mode"}
         }
+        
+        # Plugin Manager
+        self.plugin_manager = PluginManager()
         
         self.init_ui()
         self.model.logo_loader = self.logo_loader
@@ -3280,6 +4026,18 @@ class M3UEditorWindow(QMainWindow):
         self.cast_queue = []
         self.cast_poll_timer = QTimer()
         self.cast_poll_timer.timeout.connect(self.check_cast_status)
+        self.monitor_dialog = None
+        
+        # Scheduler
+        self.scheduler_timer = QTimer()
+        self.scheduler_timer.timeout.connect(self.check_scheduled_tasks)
+        self.scheduler_timer.start(60000) # Check every minute
+        
+        self.last_backup_time = self.settings.value("scheduler/last_backup", QDateTime.currentDateTime())
+        if isinstance(self.last_backup_time, str): # Handle potential type mismatch
+             self.last_backup_time = QDateTime.currentDateTime()
+        self.last_epg_run_date = self.settings.value("scheduler/last_epg_date", "")
+        self.last_val_run_date = self.settings.value("scheduler/last_val_date", "")
 
     def init_ui(self):
         # Main Layout
@@ -3312,6 +4070,11 @@ class M3UEditorWindow(QMainWindow):
         self.btn_audit = QPushButton("Security Audit")
         self.btn_audit.setToolTip("Audit streams for security and authenticity")
         self.btn_audit.clicked.connect(self.audit_streams)
+        
+        self.btn_cast = QPushButton("Cast")
+        self.btn_cast.setToolTip("Cast Selected Stream")
+        self.btn_cast.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
+        self.btn_cast.clicked.connect(self.cast_selected_stream)
         
         self.btn_stop = QPushButton("Stop Tasks")
         self.btn_stop.setToolTip("Stop all background processes")
@@ -3354,6 +4117,7 @@ class M3UEditorWindow(QMainWindow):
         toolbar.addWidget(btn_delete)
         toolbar.addWidget(self.btn_validate)
         toolbar.addWidget(self.btn_audit)
+        toolbar.addWidget(self.btn_cast)
         toolbar.addWidget(self.btn_stop)
         toolbar.addWidget(self.btn_save)
         toolbar.addWidget(self.btn_reload)
@@ -3461,8 +4225,15 @@ class M3UEditorWindow(QMainWindow):
         self.input_chno = QLineEdit()
         self.input_chno.textChanged.connect(self.update_current_entry_data)
         
+        logo_layout = QHBoxLayout()
         self.input_logo = QLineEdit()
         self.input_logo.textChanged.connect(self.update_current_entry_data)
+        btn_browse_logo = QPushButton("...")
+        btn_browse_logo.setFixedWidth(30)
+        btn_browse_logo.setToolTip("Browse for local image")
+        btn_browse_logo.clicked.connect(self.browse_logo_file)
+        logo_layout.addWidget(self.input_logo)
+        logo_layout.addWidget(btn_browse_logo)
         
         self.input_url = QLineEdit()
         self.input_url.textChanged.connect(self.update_current_entry_data)
@@ -3474,7 +4245,7 @@ class M3UEditorWindow(QMainWindow):
         form_layout.addRow("Group:", self.input_group)
         form_layout.addRow("EPG ID:", self.input_tvg_id)
         form_layout.addRow("Channel #:", self.input_chno)
-        form_layout.addRow("Logo URL:", self.input_logo)
+        form_layout.addRow("Logo URL:", logo_layout)
         form_layout.addRow("Stream URL:", self.input_url)
         form_layout.addRow("User Agent:", self.input_user_agent)
         
@@ -3599,9 +4370,17 @@ class M3UEditorWindow(QMainWindow):
         xtream_action.triggered.connect(self.load_xtream_codes)
         file_menu.addAction(xtream_action)
         
+        stalker_action = QAction("Load from Stalker Portal...", self)
+        stalker_action.triggered.connect(self.load_stalker_portal)
+        file_menu.addAction(stalker_action)
+        
         merge_action = QAction("Merge Playlist...", self)
         merge_action.triggered.connect(self.merge_m3u)
         file_menu.addAction(merge_action)
+        
+        cloud_action = QAction("Cloud Sync...", self)
+        cloud_action.triggered.connect(self.open_cloud_sync)
+        file_menu.addAction(cloud_action)
         
         save_action = QAction("Save M3U", self)
         save_action.setShortcut("Ctrl+S")
@@ -3651,6 +4430,10 @@ class M3UEditorWindow(QMainWindow):
         find_action.triggered.connect(self.find_replace)
         edit_menu.addAction(find_action)
         
+        batch_rename_action = QAction("Batch Rename (Regex)...", self)
+        batch_rename_action.triggered.connect(self.batch_rename)
+        edit_menu.addAction(batch_rename_action)
+        
         bulk_edit_action = QAction("Bulk Edit Attributes...", self)
         bulk_edit_action.triggered.connect(self.bulk_edit_attributes)
         edit_menu.addAction(bulk_edit_action)
@@ -3661,6 +4444,14 @@ class M3UEditorWindow(QMainWindow):
         dup_action = QAction("Find Duplicates", self)
         dup_action.triggered.connect(self.find_duplicates)
         tools_menu.addAction(dup_action)
+        
+        name_dup_action = QAction("Find Name Duplicates", self)
+        name_dup_action.triggered.connect(self.find_name_duplicates)
+        tools_menu.addAction(name_dup_action)
+        
+        fav_mgr_action = QAction("Favorites Manager...", self)
+        fav_mgr_action.triggered.connect(self.open_favorites_manager)
+        tools_menu.addAction(fav_mgr_action)
         
         smart_dedupe_action = QAction("Smart Dedupe...", self)
         smart_dedupe_action.triggered.connect(self.smart_dedupe)
@@ -3726,6 +4517,14 @@ class M3UEditorWindow(QMainWindow):
         diag_action.triggered.connect(self.open_stream_diagnostics)
         tools_menu.addAction(diag_action)
         
+        diff_action = QAction("Playlist Diff Tool...", self)
+        diff_action.triggered.connect(self.open_playlist_diff)
+        tools_menu.addAction(diff_action)
+        
+        gallery_action = QAction("Snapshot Gallery...", self)
+        gallery_action.triggered.connect(self.open_snapshot_gallery)
+        tools_menu.addAction(gallery_action)
+        
         record_action = QAction("Schedule Recording...", self)
         record_action.triggered.connect(self.open_scheduled_recording)
         tools_menu.addAction(record_action)
@@ -3733,6 +4532,14 @@ class M3UEditorWindow(QMainWindow):
         scanner_action = QAction("Network Stream Scanner...", self)
         scanner_action.triggered.connect(self.open_network_scanner)
         tools_menu.addAction(scanner_action)
+        
+        monitor_action = QAction("Live Stream Monitor...", self)
+        monitor_action.triggered.connect(self.open_live_monitor)
+        tools_menu.addAction(monitor_action)
+        
+        scheduler_action = QAction("Task Scheduler...", self)
+        scheduler_action.triggered.connect(self.open_task_scheduler)
+        tools_menu.addAction(scheduler_action)
         
         cast_mgr_action = QAction("Cast Manager...", self)
         cast_mgr_action.triggered.connect(self.open_cast_manager)
@@ -3761,10 +4568,15 @@ class M3UEditorWindow(QMainWindow):
         theme_editor_action.triggered.connect(self.open_theme_editor)
         view_menu.addAction(theme_editor_action)
         
-        iptv_action = QAction("IPTV Player Mode", self)
+        iptv_action = QAction("Theater Mode", self)
         iptv_action.setShortcut("F11")
         iptv_action.triggered.connect(self.open_iptv_player)
         view_menu.addAction(iptv_action)
+        
+        # Plugins Menu
+        plugins_menu = menubar.addMenu("Plugins")
+        self.plugins_menu_ref = plugins_menu
+        self.reload_plugins()
 
     # -------------------------------------------------------------------------
     # Actions
@@ -4172,6 +4984,64 @@ class M3UEditorWindow(QMainWindow):
             self.settings.setValue("epg_urls", self.epg_urls)
             QMessageBox.information(self, "Xtream Codes", "Playlist loaded and EPG configured.")
 
+    def open_cloud_sync(self):
+        dlg = CloudSyncDialog(self.settings, self)
+        dlg.exec()
+
+    def save_to_cloud(self, folder):
+        if not folder or not os.path.exists(folder):
+            QMessageBox.warning(self, "Error", "Invalid cloud folder path.")
+            return
+        if not self.entries:
+            QMessageBox.warning(self, "Error", "No playlist to save.")
+            return
+            
+        filename = "playlist.m3u"
+        if self.current_file_path:
+            filename = os.path.basename(self.current_file_path)
+            
+        target = os.path.join(folder, filename)
+        try:
+            M3UParser.save_file(target, self.entries)
+            QMessageBox.information(self, "Cloud Sync", f"Playlist saved to:\n{target}")
+            self.log_action(f"Saved to cloud: {target}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Cloud save failed: {e}")
+
+    def load_from_cloud(self, folder):
+        if not folder or not os.path.exists(folder):
+            QMessageBox.warning(self, "Error", "Invalid cloud folder path.")
+            return
+        f, _ = QFileDialog.getOpenFileName(self, "Select Playlist from Cloud", folder, "M3U Files (*.m3u *.m3u8)")
+        if f:
+            self.load_recent_file(f)
+
+    def load_stalker_portal(self):
+        dlg = StalkerLoginDialog(self)
+        if dlg.exec():
+            portal_url, mac = dlg.get_credentials()
+            if not portal_url or not mac:
+                QMessageBox.warning(self, "Error", "Please fill in all fields.")
+                return
+            
+            self.status_label.setText("Connecting to Stalker Portal...")
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setRange(0, 0)
+            
+            worker = StalkerWorker(portal_url, mac)
+            worker.signals.finished.connect(self.on_stalker_loaded)
+            worker.signals.error.connect(lambda err: QMessageBox.critical(self, "Error", f"Stalker Error: {err}"))
+            worker.signals.error.connect(lambda: self.progress_bar.setVisible(False))
+            self.thread_pool.start(worker)
+
+    def on_stalker_loaded(self, entries):
+        self.progress_bar.setVisible(False)
+        self.undo_stack.clear()
+        self.entries = entries
+        self.model.entries = self.entries
+        self.refresh_table()
+        self.status_label.setText(f"Loaded {len(entries)} channels from Stalker Portal")
+
     def merge_m3u(self):
         file_name, _ = QFileDialog.getOpenFileName(self, "Merge M3U File", "", "M3U Files (*.m3u *.m3u8);;All Files (*)")
         if file_name:
@@ -4449,7 +5319,7 @@ class M3UEditorWindow(QMainWindow):
             self.settings.setValue("epg_urls", self.epg_urls)
             self.load_epg()
 
-    def load_epg(self):
+    def load_epg(self, silent=False):
         """Starts the EPG worker to fetch and parse data."""
         if not self.epg_urls:
             return
@@ -4460,7 +5330,7 @@ class M3UEditorWindow(QMainWindow):
         self.btn_epg.setEnabled(False)
         
         worker = EPGWorker(self.epg_urls)
-        worker.signals.finished.connect(self.on_epg_loaded)
+        worker.signals.finished.connect(lambda data, count: self.on_epg_loaded(data, count, silent))
         worker.signals.error.connect(lambda err: self.status_label.setText(f"EPG Error: {err}"))
         worker.signals.progress.connect(self.status_label.setText)
         # Reset UI on error
@@ -4468,31 +5338,6 @@ class M3UEditorWindow(QMainWindow):
         worker.signals.error.connect(lambda: self.progress_bar.setVisible(False))
         
         self.thread_pool.start(worker)
-
-    def on_epg_loaded(self, data):
-        """Handles successful EPG data loading."""
-        self.epg_manager.set_data(data)
-        self.model.layoutChanged.emit() # Refresh all views
-        
-        count = len(data["channels"])
-        progs = sum(len(p) for p in data["programs"].values())
-        
-        # Calculate how many playlist entries actually have EPG data now
-        matched_count = 0
-        for entry in self.entries:
-            if self.epg_manager.get_current_program(entry.tvg_id, entry.name):
-                matched_count += 1
-        
-        self.status_label.setText(f"EPG Loaded: {count} channels, {progs} programs. Matched to {matched_count} playlist entries.")
-        self.progress_bar.setVisible(False)
-        self.btn_epg.setEnabled(True)
-        
-        msg = (f"Successfully loaded EPG data.\n\n"
-               f"EPG Channels: {count}\n"
-               f"Total Programs: {progs}\n"
-               f"Matched Playlist Entries: {matched_count}")
-        QMessageBox.information(self, "EPG Loaded", msg)
-        
 
     def update_current_entry_data(self):
         """Updates the data model when the user types in the editor fields."""
@@ -4651,6 +5496,31 @@ class M3UEditorWindow(QMainWindow):
             self.set_modified(True)
             self.log_action(f"Bulk edited group for {len(rows)} items")
 
+    def open_favorites_manager(self):
+        dlg = FavoritesManagerDialog(self.entries, self)
+        if dlg.exec():
+            self.create_backup("fav_manager")
+            self.save_undo_state()
+            
+            ordered_favs = dlg.get_ordered_favorites()
+            
+            # Remove all favorites from main list (keeping non-favorites)
+            non_favs = [e for e in self.entries if not e.favorite]
+            
+            # Prepend ordered favorites to the list
+            self.entries = ordered_favs + non_favs
+            
+            self.model.entries = self.entries
+            self.refresh_table()
+            self.set_modified(True)
+            self.log_action("Reordered favorites via Manager")
+
+    def browse_logo_file(self):
+        file_name, _ = QFileDialog.getOpenFileName(self, "Select Logo Image", "", "Images (*.png *.jpg *.jpeg *.gif *.svg)")
+        if file_name:
+            url = QUrl.fromLocalFile(file_name).toString()
+            self.input_logo.setText(url)
+
     def bulk_edit_attributes(self):
         selected_indices = self.get_selected_rows()
         if not selected_indices:
@@ -4740,6 +5610,41 @@ class M3UEditorWindow(QMainWindow):
             self.set_modified(True)
             QMessageBox.information(self, "Result", f"Replaced {count} occurrences.")
             self.log_action(f"Find & Replace: {count} occurrences of '{find_text}'")
+
+    def batch_rename(self):
+        dlg = BatchRenameDialog(self)
+        if dlg.exec():
+            find_pat, replace_pat, use_regex, case_sens = dlg.get_data()
+            if not find_pat: return
+            
+            self.create_backup("batch_rename")
+            self.save_undo_state()
+            count = 0
+            
+            for entry in self.entries:
+                if use_regex:
+                    flags = 0 if case_sens else re.IGNORECASE
+                    try:
+                        if re.search(find_pat, entry.name, flags=flags):
+                            new_name = re.sub(find_pat, replace_pat, entry.name, flags=flags)
+                            if new_name != entry.name:
+                                entry.name = new_name
+                                count += 1
+                    except re.error:
+                        QMessageBox.critical(self, "Regex Error", "Invalid regular expression.")
+                        return
+                else:
+                    # Simple string replace (case insensitive via regex escape if needed)
+                    flags = 0 if case_sens else re.IGNORECASE
+                    pattern = re.escape(find_pat)
+                    if re.search(pattern, entry.name, flags=flags):
+                        entry.name = re.sub(pattern, replace_pat, entry.name, flags=flags)
+                        count += 1
+            
+            self.refresh_table(clear_cache=False)
+            self.set_modified(True)
+            QMessageBox.information(self, "Success", f"Renamed {count} channels.")
+            self.log_action(f"Batch rename: {count} items")
 
     def open_channel_numbering(self):
         dlg = ChannelNumberingDialog(self)
@@ -4988,7 +5893,7 @@ class M3UEditorWindow(QMainWindow):
         worker.signals.error.connect(lambda err: QMessageBox.critical(self, "Error", f"EPG Error: {err}"))
         self.thread_pool.start(worker)
 
-    def on_epg_loaded(self, epg_map, count):
+    def on_epg_loaded(self, epg_map, count, silent=False):
         self.progress_bar.setVisible(False)
         self.status_label.setText(f"EPG Parsed: {count} channels found.")
         self.btn_stop.setEnabled(False)
@@ -5031,7 +5936,8 @@ class M3UEditorWindow(QMainWindow):
                     entry.logo = match_data['logo']
         
         self.refresh_table()
-        QMessageBox.information(self, "Success", f"Updated {matched} channels with EPG data.")
+        if not silent:
+            QMessageBox.information(self, "Success", f"Updated {matched} channels with EPG data.")
         self.log_action(f"Updated EPG data for {matched} channels")
         
     def smart_group_channels(self):
@@ -5419,6 +6325,54 @@ class M3UEditorWindow(QMainWindow):
             self.table.selectionModel().select(selection, QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
             self.model.layoutChanged.emit() # Refresh highlights
 
+    def find_name_duplicates(self):
+        name_map = {}
+        duplicate_indices = []
+        
+        self.model.highlight_data.clear()
+
+        # Group by name (case-insensitive)
+        for i, entry in enumerate(self.entries):
+            name = entry.name.strip().lower()
+            if name not in name_map:
+                name_map[name] = []
+            name_map[name].append(i)
+
+        # Filter for names with multiple entries having different URLs
+        for name, indices in name_map.items():
+            if len(indices) > 1:
+                urls = set(self.entries[i].url for i in indices)
+                if len(urls) > 1:
+                    duplicate_indices.extend(indices)
+
+        if not duplicate_indices:
+            QMessageBox.information(self, "Name Duplicates", "No channels found with identical names but different URLs.")
+            return
+
+        reply = QMessageBox.question(
+            self, 
+            "Name Duplicates Found", 
+            f"Found {len(duplicate_indices)} entries with identical names but different URLs.\n\n"
+            "Yes: Highlight them in the list\n"
+            "No: Cancel",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            self.table.clearSelection()
+            selection = QItemSelection()
+            for row in duplicate_indices:
+                entry = self.entries[row]
+                self.model.highlight_data[id(entry)] = QColor("#e1bee7") # Light Purple
+                
+                source_index = self.model.index(row, 0)
+                proxy_index = self.proxy_model.mapFromSource(source_index)
+                if proxy_index.isValid():
+                    selection.select(proxy_index, proxy_index)
+            
+            self.table.selectionModel().select(selection, QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+            self.model.layoutChanged.emit() # Refresh highlights
+
     def smart_dedupe(self):
         if not self.entries:
             QMessageBox.warning(self, "Warning", "No entries to process.")
@@ -5640,6 +6594,10 @@ class M3UEditorWindow(QMainWindow):
         edit_group_action.triggered.connect(self.bulk_edit_group)
         menu.addAction(edit_group_action)
         
+        set_logo_action = QAction("Set Logo from File...", self)
+        set_logo_action.triggered.connect(self.set_logo_from_file_context)
+        menu.addAction(set_logo_action)
+        
         menu.addSeparator()
         
         play_vlc_action = QAction("Open in VLC", self)
@@ -5654,6 +6612,21 @@ class M3UEditorWindow(QMainWindow):
         sender = self.sender()
         if isinstance(sender, (QTableView, QListView)):
             menu.exec(sender.viewport().mapToGlobal(position))
+
+    def set_logo_from_file_context(self):
+        selected_rows = self.get_selected_rows()
+        if not selected_rows: return
+        
+        file_name, _ = QFileDialog.getOpenFileName(self, "Select Logo Image", "", "Images (*.png *.jpg *.jpeg *.gif *.svg)")
+        if file_name:
+            url = QUrl.fromLocalFile(file_name).toString()
+            self.save_undo_state()
+            for index in selected_rows:
+                source_index = self.proxy_model.mapToSource(index)
+                self.entries[source_index.row()].logo = url
+            self.refresh_table(clear_cache=False)
+            self.set_modified(True)
+            self.log_action("Set logo from file for selected items")
 
     def open_settings(self):
         current_path = self.settings.value("vlc_path", "")
@@ -5729,6 +6702,7 @@ class M3UEditorWindow(QMainWindow):
             idx = self.proxy_model.mapToSource(selected[0]).row()
             
         self.iptv_window = IPTVPlayerWindow(self.entries, idx, self)
+        self.iptv_window.setWindowTitle("Theater Mode")
         self.iptv_window.show()
 
     def open_speed_test(self):
@@ -5976,6 +6950,111 @@ class M3UEditorWindow(QMainWindow):
         entry = self.entries[idx.row()]
         dlg = CastDialog(entry.url, self, stream_name=entry.name)
         dlg.exec()
+
+    def open_snapshot_gallery(self):
+        dlg = SnapshotGalleryDialog(self)
+        dlg.exec()
+
+    def open_playlist_diff(self):
+        dlg = PlaylistDiffDialog(self.entries, self)
+        dlg.exec()
+
+    def open_live_monitor(self):
+        selected_rows = self.get_selected_rows()
+        entries_to_monitor = []
+        if selected_rows:
+            for idx in selected_rows:
+                source_index = self.proxy_model.mapToSource(idx)
+                entries_to_monitor.append(self.entries[source_index.row()])
+        else:
+            entries_to_monitor = self.entries
+
+        if not entries_to_monitor:
+             QMessageBox.warning(self, "Warning", "No streams to monitor.")
+             return
+
+        self.monitor_dialog = LiveStreamMonitorDialog(entries_to_monitor, self)
+        self.monitor_dialog.show()
+
+    def open_task_scheduler(self):
+        dlg = TaskSchedulerDialog(self.settings, self)
+        dlg.exec()
+
+    def check_scheduled_tasks(self):
+        now = QDateTime.currentDateTime()
+        
+        # Backup
+        if self.settings.value("scheduler/backup_enabled", False, type=bool):
+            interval = self.settings.value("scheduler/backup_interval", 24, type=int)
+            # If last backup was more than interval hours ago
+            if self.last_backup_time.secsTo(now) >= interval * 3600:
+                self.create_backup("scheduled")
+                self.last_backup_time = now
+                self.settings.setValue("scheduler/last_backup", now)
+        
+        # EPG
+        if self.settings.value("scheduler/epg_enabled", False, type=bool):
+            target_time = self.settings.value("scheduler/epg_time", type=QTime)
+            if target_time:
+                current_date_str = now.toString("yyyy-MM-dd")
+                if self.last_epg_run_date != current_date_str:
+                    if now.time() >= target_time:
+                        self.load_epg(silent=True)
+                        self.last_epg_run_date = current_date_str
+                        self.settings.setValue("scheduler/last_epg_date", current_date_str)
+
+        # Validation
+        if self.settings.value("scheduler/val_enabled", False, type=bool):
+            target_time = self.settings.value("scheduler/val_time", type=QTime)
+            if target_time:
+                current_date_str = now.toString("yyyy-MM-dd")
+                if self.last_val_run_date != current_date_str:
+                    if now.time() >= target_time:
+                        self.validate_streams()
+                        self.last_val_run_date = current_date_str
+                        self.settings.setValue("scheduler/last_val_date", current_date_str)
+
+    def reload_plugins(self):
+        self.plugin_manager.discover_plugins()
+        self.plugins_menu_ref.clear()
+        
+        reload_action = QAction("Reload Plugins", self)
+        reload_action.triggered.connect(self.reload_plugins)
+        self.plugins_menu_ref.addAction(reload_action)
+        
+        open_folder_action = QAction("Open Plugins Folder", self)
+        open_folder_action.triggered.connect(self.open_plugins_folder)
+        self.plugins_menu_ref.addAction(open_folder_action)
+        
+        self.plugins_menu_ref.addSeparator()
+        
+        plugins = self.plugin_manager.plugins
+        if not plugins:
+            no_plug = QAction("No plugins found", self)
+            no_plug.setEnabled(False)
+            self.plugins_menu_ref.addAction(no_plug)
+        else:
+            for plugin in plugins:
+                action = QAction(plugin["name"], self)
+                action.triggered.connect(lambda checked, p=plugin: self.run_plugin(p))
+                self.plugins_menu_ref.addAction(action)
+
+    def run_plugin(self, plugin):
+        try:
+            logging.info(f"Running plugin: {plugin['name']}")
+            plugin["run"](self)
+        except Exception as e:
+            logging.error(f"Error running plugin {plugin['name']}: {e}", exc_info=True)
+            QMessageBox.critical(self, "Plugin Error", f"Error running plugin '{plugin['name']}':\n{str(e)}")
+
+    def open_plugins_folder(self):
+        path = self.plugin_manager.plugin_dir
+        if sys.platform == 'win32':
+            os.startfile(path)
+        elif sys.platform == 'darwin':
+            subprocess.Popen(['open', path])
+        else:
+            subprocess.Popen(['xdg-open', path])
 
 # -----------------------------------------------------------------------------
 # Main Execution

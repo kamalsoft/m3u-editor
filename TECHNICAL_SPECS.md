@@ -48,6 +48,14 @@ The application relies heavily on `QThreadPool` and `QRunnable` to keep the UI r
 | `ResolutionWorker` | Uses `subprocess` to call `ffprobe` and detect video resolution. | `result(row, resolution)` |
 | `LatencyWorker` | Measures Time-To-First-Byte (TTFB). | `result(row, ms, error)` |
 | `SecurityAuditWorker` | Checks SSL, Content-Type, and redirects. | `result(row, dict)` |
+| `StalkerWorker` | Authenticates and fetches playlist from Stalker Middleware portals. | `finished(entries)`, `error(msg)` |
+| `CastConnectWorker` | Handles connection to Chromecast devices. | `success()`, `error(msg)` |
+| `CastDiscoveryWorker` | Scans for Chromecast devices. | `found(cast)`, `finished()` |
+| `NetworkScannerWorker` | Scans for UPnP/DLNA devices via SSDP. | `found(name, loc)`, `finished()` |
+| `SpeedTestWorker` | Measures download speed. | `progress(int)`, `result(str)`, `error(str)` |
+| `FFmpegWorker` | Runs FFmpeg commands for transcoding/recording. | `output(str)`, `finished()`, `error(str)` |
+| `DiagnosticsWorker` | Runs ffprobe for stream analysis. | `result(dict)`, `error(str)` |
+| `LogoWizardWorker` | Matches logos from a repository. | `found(row, url)`, `finished(count)` |
 
 **Note on Thread Safety**: Workers emit signals to communicate with the main thread. Direct modification of the `entries` list or UI widgets from workers is avoided.
 
@@ -75,6 +83,13 @@ The application relies heavily on `QThreadPool` and `QRunnable` to keep the UI r
 ### 5.3 Smart Grouping
 *   Uses a dictionary of Regex patterns (`categories`) to classify channels based on keywords in their names.
 *   Supports optional resolution detection and country flag detection during grouping.
+
+### 5.4 Plugin System
+*   **`PluginManager`**: Discovers and loads Python scripts from the `plugins/` directory.
+*   **Interface**: Plugins must define a `run(window)` function which receives the main window instance.
+
+### 5.5 Task Scheduler
+*   **Implementation**: Uses `QTimer` in the main window to check for scheduled tasks (Backup, EPG, Validation) every minute against `QSettings`.
 
 ## 6. Known Issues & Future Work
 

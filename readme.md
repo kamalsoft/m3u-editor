@@ -5,7 +5,7 @@ A robust, cross-platform GUI application built with Python and PyQt6 for managin
 ## Features
 
 ### 🚀 Playlist Management
-*   **Universal Loading**: Load M3U/M3U8 files, download from URLs, or login via **Xtream Codes API**.
+*   **Universal Loading**: Load M3U/M3U8 files, download from URLs, or login via **Xtream Codes API** and **Stalker Portal**.
 *   **Merge & Split**: Merge multiple playlists with strategies (Append, Replace, Deduplicate) or split a playlist into separate files by Group.
 *   **Export**: Save with custom encoding or export metadata to CSV.
 *   **History**: Robust Undo/Redo system and action logging.
@@ -16,6 +16,7 @@ A robust, cross-platform GUI application built with Python and PyQt6 for managin
 *   **Smart Grouping**: Regex-based auto-categorization (Sports, Movies, News, etc.) with resolution and country detection.
 *   **Channel Numbering**: Wizard to renumber channels, sort by group, and apply prefixes.
 *   **Find & Replace**: Advanced search with Regular Expression support.
+*   **Playlist Diff**: Compare the current playlist with another file to identify added, removed, or modified channels.
 *   **Deduplication**:
     *   **Find Duplicates**: Identify and highlight or batch delete duplicate URLs.
     *   **Smart Dedupe**: Intelligent removal keeping the entry with the highest resolution or most metadata.
@@ -28,6 +29,7 @@ A robust, cross-platform GUI application built with Python and PyQt6 for managin
 *   **Stream Preview**: Live video preview with playback controls, aspect ratio, speed control, and audio/subtitle track selection.
 *   **IPTV Player Mode**: Dedicated full-screen interface with channel list, search, and **Picture-in-Picture (PiP)** support.
 *   **Storyboard**: Generate frame-by-frame visual storyboards of streams.
+*   **Snapshot Gallery**: View, manage, and export captured snapshots.
 *   **Casting**:
     *   **Chromecast/DLNA**: Cast streams to devices on your network.
     *   **Cast Manager**: Control volume, seek, stop, and manage a **Cast Queue** for continuous playback.
@@ -36,6 +38,7 @@ A robust, cross-platform GUI application built with Python and PyQt6 for managin
 
 ### 🛡️ Diagnostics & Security
 *   **Health Check**: Validate streams via asynchronous HTTP HEAD/GET requests.
+*   **Live Stream Monitor**: Dashboard to continuously monitor the health of selected streams.
 *   **Security Audit**: Scan for SSL validity, suspicious content types, redirects, and reputation.
 *   **Stream Diagnostics**: Detailed technical analysis (Codec, Bitrate, Resolution) using `ffprobe`.
 *   **Resolution & Latency**: Detect stream resolution (SD, HD, 4K) and measure response time (TTFB).
@@ -47,6 +50,8 @@ A robust, cross-platform GUI application built with Python and PyQt6 for managin
 *   **Scheduled Recording**: Record live streams for a set duration.
 *   **Network Speed Test**: Integrated download speed test.
 *   **EPG Integration**: Load XMLTV EPGs (supports .gz/.xz), cache locally, and view program schedules.
+*   **Task Scheduler**: Automate backups, EPG updates, and playlist validation.
+*   **Plugin System**: Extend functionality with external Python scripts.
 
 ### 🎨 UI & Customization
 *   **Theme Editor**: Customize application colors and save themes.
@@ -105,8 +110,6 @@ This application prioritizes your security:
 ## Roadmap
 
 *   **Cloud Sync**: Integration with Google Drive/Dropbox for syncing playlists across devices.
-*   **Scheduled Recording**: Ability to schedule stream recordings based on EPG data.
-*   **Transcoding Support**: Convert streams to different formats using FFmpeg integration.
 *   **Advanced EPG**: Support for multiple EPG sources per playlist and manual channel mapping.
 
 ## License
