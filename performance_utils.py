@@ -153,7 +153,7 @@ class FastM3UParser:
                     current_entry["duration"] = dur_match.group(1)
                 
                 # Extract other attributes using a simpler regex or string splitting
-                for attr in ["group-title", "tvg-logo", "tvg-id", "tvg-chno"]:
+                for attr in ["group-title", "tvg-logo", "tvg-id", "tvg-chno", "tvg-fav", "tvg-health"]:
                     match = re.search(f'{attr}="([^"]*)"', attr_part)
                     if match:
                         current_entry[attr.replace("-", "_").replace("group_title", "group")] = match.group(1)

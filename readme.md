@@ -8,6 +8,7 @@ A robust, cross-platform GUI application built with Python and PyQt6 for managin
 *   **Load from URL**: Download and edit playlists directly from a web link with a dedicated **Reload** button for quick refreshes.
 *   **Performance Optimized**:
     *   **Fast Parsing**: High-performance M3U parser for near-instant loading of large playlists.
+    *   **Virtual List View**: Efficient handling of large datasets using `QAbstractTableModel` and `QListView`.
     *   **Efficient Undo/Redo**: Delta-based undo system reduces memory overhead.
     *   **Throttled Logo Loading**: Background logo fetching with targeted UI updates for smooth scrolling.
 *   **Enhanced Stream Preview**:
@@ -24,10 +25,20 @@ A robust, cross-platform GUI application built with Python and PyQt6 for managin
     *   **Manage Groups**: Dedicated dialog to bulk rename, add, or delete groups across the entire playlist.
     *   **Drag and Drop**: Reorder channels easily by dragging rows.
     *   **Context Menu**: Quick "Edit Group" and "Open in VLC" actions.
+    *   **Country Flags**: Auto-detect country from channel names and append flags to group titles.
 *   **Health Check**: Validate stream URLs via asynchronous HTTP HEAD requests with granular feedback.
+*   **Favorites System**: Pin channels to a dedicated view using the "Favorites" toggle.
 *   **Search & Filter**: Real-time search and group-based filtering.
 *   **Export**: Export playlists to CSV format.
 *   **Dark Mode**: Sleek, modern dark theme for reduced eye strain.
+*   **Advanced Tools**:
+    *   **Backup & Restore**: Automatic ZIP-based backups created before major operations; easy restore wizard.
+    *   **Channel Numbering Wizard**: Renumber channels or add prefixes based on group sorting.
+    *   **Resolution Checker**: Uses `ffprobe` to detect stream resolution (SD, HD, 4K).
+    *   **Latency Checker**: Measure Time-To-First-Byte (TTFB) for streams.
+    *   **Logo Scraper**: Attempt to find missing logos via Google Images search.
+    *   **Find Duplicates**: Identify and highlight duplicate stream URLs.
+    *   **Xtream Codes Support**: Load playlists and EPG directly from Xtream Codes API credentials.
 
 ## Demo
 
@@ -39,6 +50,7 @@ A robust, cross-platform GUI application built with Python and PyQt6 for managin
 *   Python 3.x
 *   PyQt6
 *   VLC (Optional, for external playback)
+*   FFmpeg/ffprobe (Optional, for Resolution Checker)
 
 ## Installation
 
@@ -66,6 +78,7 @@ pip install PyQt6
 6.  **Manage Groups**: Use the **Manage Groups** button to perform bulk group operations.
 7.  **Save**: Click the **Save** button (enabled when changes are made to local files) to persist your work. Modified files are marked with an asterisk (*) in the title bar.
 
+
 ## Security & Privacy
 
 This application prioritizes your security:
@@ -76,9 +89,7 @@ This application prioritizes your security:
 ## Roadmap
 
 *   **EPG (Electronic Program Guide) Integration**: Support for XMLTV files to display "Now Playing" information and full program schedules.
-*   **Xtream Codes API Support**: Direct login support for IPTV providers using Xtream Codes credentials for automatic playlist and EPG updates.
 *   **Advanced Playlist Deduplication & Merging**: A smart wizard to combine multiple playlists, intelligently detect duplicates, and manage stream sources.
-*   **Favorites System**: Quick access to frequently used channels with a dedicated "Favorites" group.
 *   **Batch Rename & Find/Replace**: Advanced regex-based tools for bulk channel name and metadata editing.
 
 ## License

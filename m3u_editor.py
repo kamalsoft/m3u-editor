@@ -16,6 +16,7 @@ import time
 import logging
 import gzip
 import lzma
+import difflib
 from datetime import datetime
 from dataclasses import dataclass
 from typing import List, Optional, Iterable, Dict, Any
@@ -71,6 +72,8 @@ class M3UEntry:
     tvg_chno: str = ""
     duration: str = "-1"
     user_agent: str = ""
+    favorite: bool = False
+    health_status: str = ""
     raw_extinf: str = ""  # Keep original attributes to preserve unedited data
 
     def to_m3u_string(self) -> str:
@@ -87,6 +90,10 @@ class M3UEntry:
             attributes.append(f'tvg-logo="{self.logo}"')
         if self.tvg_chno:
             attributes.append(f'tvg-chno="{self.tvg_chno}"')
+        if self.favorite:
+            attributes.append('tvg-fav="1"')
+        if self.health_status:
+            attributes.append(f'tvg-health="{self.health_status}"')
         
         # You can add more specific tvg- tags here if needed
         attr_str = " ".join(attributes)
@@ -122,6 +129,8 @@ class M3UParser:
                 tvg_id=e.get("tvg_id", ""),
                 tvg_chno=e.get("tvg_chno", ""),
                 duration=e.get("duration", "-1"),
+                favorite=(e.get("tvg_fav", "0") == "1"),
+                health_status=e.get("tvg_health", ""),
                 user_agent=e.get("user_agent", ""),
                 raw_extinf=e.get("raw_extinf", "")
             )
@@ -536,6 +545,60 @@ class SecurityAuditWorker(QRunnable):
         finally:
             self.signals.finished.emit()
 
+class RepairSignals(QObject):
+    result = pyqtSignal(int, bool, str) # row_index, success, new_url
+    finished = pyqtSignal()
+
+class RepairWorker(QRunnable):
+    """Worker to attempt auto-repair of broken streams."""
+    def __init__(self, row_index, url, user_agent):
+        super().__init__()
+        self.row_index = row_index
+        self.url = url
+        self.user_agent = user_agent
+        self.signals = RepairSignals()
+
+    def run(self):
+        new_url = self.attempt_repair(self.url)
+        if new_url:
+            self.signals.result.emit(self.row_index, True, new_url)
+        else:
+            self.signals.result.emit(self.row_index, False, "")
+        self.signals.finished.emit()
+
+    def attempt_repair(self, url):
+        headers = {'User-Agent': self.user_agent if self.user_agent else 'Mozilla/5.0'}
+        
+        def check(u):
+            try:
+                req = urllib.request.Request(u, headers=headers, method='HEAD')
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    if 200 <= resp.status < 400:
+                        return True
+            except:
+                pass
+            return False
+
+        # 1. Follow redirects (GET request to see where it lands)
+        try:
+            req = urllib.request.Request(url, headers=headers, method='GET')
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if 200 <= resp.status < 400:
+                    # If the URL changed (redirect), return the new one
+                    return resp.geturl()
+        except:
+            pass
+
+        # 2. Protocol swap (HTTP <-> HTTPS)
+        if url.startswith("http://"):
+            alt = url.replace("http://", "https://", 1)
+            if check(alt): return alt
+        elif url.startswith("https://"):
+            alt = url.replace("https://", "http://", 1)
+            if check(alt): return alt
+            
+        return None
+
 class PlaylistModel(QAbstractTableModel):
     """Model to handle playlist data efficiently."""
     request_logo = pyqtSignal(str)
@@ -578,7 +641,7 @@ class PlaylistModel(QAbstractTableModel):
         
         if role == Qt.ItemDataRole.DisplayRole:
             if index.column() == 0: return entry.group
-            if index.column() == 1: return entry.name
+            if index.column() == 1: return f"★ {entry.name}" if entry.favorite else entry.name
             if index.column() == 2: return entry.url
             if index.column() == 3:
                 audit = self.security_data.get(id(entry))
@@ -586,6 +649,10 @@ class PlaylistModel(QAbstractTableModel):
             
         elif role == Qt.ItemDataRole.UserRole:
             return entry
+
+        elif role == Qt.ItemDataRole.EditRole:
+            # Return clean name for editing
+            if index.column() == 1: return entry.name
             
         elif role == Qt.ItemDataRole.UserRole + 1:
             return self.validation_data.get(id(entry), (None, None, None))[2]
@@ -680,6 +747,8 @@ class PlaylistProxyModel(QSortFilterProxyModel):
         self.filter_text = ""
         self.filter_group = "All Groups"
         self.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.show_favorites_only = False
+        self.filter_health = "All Health"
 
     def filterAcceptsRow(self, source_row, source_parent):
         model = self.sourceModel()
@@ -688,6 +757,24 @@ class PlaylistProxyModel(QSortFilterProxyModel):
             
         entry = model.entries[source_row]
         
+        if self.show_favorites_only and not entry.favorite:
+            return False
+
+        # Health Filter
+        if self.filter_health != "All Health":
+            val_data = model.validation_data.get(id(entry))
+            is_valid = val_data[2] if val_data else None
+            
+            # Fallback to stored status string if runtime data missing
+            if is_valid is None and entry.health_status:
+                st = entry.health_status.lower()
+                if "ok" in st: is_valid = True
+                elif "error" in st or "status" in st or "http" in st: is_valid = False
+            
+            if self.filter_health == "Valid" and is_valid is not True: return False
+            if self.filter_health == "Invalid" and is_valid is not False: return False
+            if self.filter_health == "Untested" and is_valid is not None: return False
+
         name_match = self.filter_text.lower() in entry.name.lower()
         group_match = (self.filter_group == "All Groups" or entry.group == self.filter_group)
         
@@ -825,6 +912,55 @@ class FindReplaceDialog(QDialog):
     def get_data(self):
         return (self.find_input.text(), self.replace_input.text(), 
                 self.field_combo.currentText(), self.case_check.isChecked())
+
+class BulkEditDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Bulk Edit Attributes")
+        self.resize(400, 300)
+        layout = QVBoxLayout(self)
+        
+        layout.addWidget(QLabel("Select attributes to update for selected channels:"))
+        
+        self.fields = {
+            "Group": "group",
+            "Logo URL": "logo",
+            "EPG ID (tvg-id)": "tvg_id",
+            "Channel # (tvg-chno)": "tvg_chno",
+            "User Agent": "user_agent"
+        }
+        self.inputs = {}
+        self.checks = {}
+        
+        form = QFormLayout()
+        
+        for label, attr in self.fields.items():
+            check = QCheckBox(label)
+            inp = QLineEdit()
+            inp.setEnabled(False)
+            check.toggled.connect(inp.setEnabled)
+            
+            self.checks[attr] = check
+            self.inputs[attr] = inp
+            
+            row_layout = QHBoxLayout()
+            row_layout.addWidget(check)
+            row_layout.addWidget(inp)
+            form.addRow(row_layout)
+            
+        layout.addLayout(form)
+        
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+        
+    def get_updates(self):
+        updates = {}
+        for attr, check in self.checks.items():
+            if check.isChecked():
+                updates[attr] = self.inputs[attr].text()
+        return updates
 
 class ChannelNumberingDialog(QDialog):
     def __init__(self, parent=None):
@@ -1532,6 +1668,36 @@ class StatisticsDialog(QDialog):
         tab = self.create_table(counts, ["Status", "Count", "Distribution"])
         self.tabs.addTab(tab, "Health")
 
+class XtreamLoginDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Xtream Codes Login")
+        self.resize(400, 200)
+        layout = QVBoxLayout(self)
+        
+        form = QFormLayout()
+        self.url_edit = QLineEdit()
+        self.url_edit.setPlaceholderText("http://domain.com:port")
+        self.user_edit = QLineEdit()
+        self.pass_edit = QLineEdit()
+        self.pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        
+        form.addRow("Host URL:", self.url_edit)
+        form.addRow("Username:", self.user_edit)
+        form.addRow("Password:", self.pass_edit)
+        layout.addLayout(form)
+        
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+        
+    def get_credentials(self):
+        url = self.url_edit.text().strip()
+        if url and not url.startswith("http"):
+            url = "http://" + url
+        return url, self.user_edit.text().strip(), self.pass_edit.text().strip()
+
 # -----------------------------------------------------------------------------
 # GUI Implementation
 # -----------------------------------------------------------------------------
@@ -1701,9 +1867,14 @@ class M3UEditorWindow(QMainWindow):
         self.group_combo = QComboBox()
         self.group_combo.setFixedWidth(150)
         self.group_combo.addItem("All Groups")
-        self.group_combo.currentTextChanged.connect(self.filter_table)
+        self.group_combo.currentTextChanged.connect(self.on_group_combo_changed)
         
-        toolbar.addWidget(btn_add)
+        self.health_combo = QComboBox()
+        self.health_combo.setFixedWidth(120)
+        self.health_combo.addItems(["All Health", "Valid", "Invalid", "Untested"])
+        self.health_combo.currentTextChanged.connect(self.filter_table)
+        
+        # toolbar.addWidget(btn_add) # Already added above
         toolbar.addWidget(btn_delete)
         toolbar.addWidget(self.btn_validate)
         toolbar.addWidget(self.btn_audit)
@@ -1717,8 +1888,16 @@ class M3UEditorWindow(QMainWindow):
         toolbar.addWidget(btn_manage_groups)
         
         toolbar.addStretch()
+        
+        self.btn_show_fav = QPushButton("★ Favorites")
+        self.btn_show_fav.setToolTip("Show Favorites Group")
+        self.btn_show_fav.setCheckable(True)
+        self.btn_show_fav.clicked.connect(self.toggle_favorites_filter)
+        toolbar.addWidget(self.btn_show_fav)
+        
         toolbar.addWidget(QLabel("Filter:"))
         toolbar.addWidget(self.group_combo)
+        toolbar.addWidget(self.health_combo)
         toolbar.addWidget(self.search_bar)
         
         main_layout.addLayout(toolbar)
@@ -1895,6 +2074,10 @@ class M3UEditorWindow(QMainWindow):
         load_url_action.triggered.connect(self.load_m3u_from_url)
         file_menu.addAction(load_url_action)
         
+        xtream_action = QAction("Load from Xtream Codes...", self)
+        xtream_action.triggered.connect(self.load_xtream_codes)
+        file_menu.addAction(xtream_action)
+        
         merge_action = QAction("Merge Playlist...", self)
         merge_action.triggered.connect(self.merge_m3u)
         file_menu.addAction(merge_action)
@@ -1941,6 +2124,10 @@ class M3UEditorWindow(QMainWindow):
         find_action.setShortcut("Ctrl+F")
         find_action.triggered.connect(self.find_replace)
         edit_menu.addAction(find_action)
+        
+        bulk_edit_action = QAction("Bulk Edit Attributes...", self)
+        bulk_edit_action.triggered.connect(self.bulk_edit_attributes)
+        edit_menu.addAction(bulk_edit_action)
         
         # Tools Menu
         tools_menu = menubar.addMenu("Tools")
@@ -2281,6 +2468,26 @@ class M3UEditorWindow(QMainWindow):
         except Exception as e:
             logging.error(f"Failed to load URL: {e}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Could not load URL: {str(e)}")
+
+    def load_xtream_codes(self):
+        dlg = XtreamLoginDialog(self)
+        if dlg.exec():
+            base_url, username, password = dlg.get_credentials()
+            if not base_url or not username or not password:
+                QMessageBox.warning(self, "Error", "Please fill in all fields.")
+                return
+            
+            base_url = base_url.rstrip('/')
+            playlist_url = f"{base_url}/get.php?username={username}&password={password}&type=m3u_plus&output=ts"
+            epg_url = f"{base_url}/xmltv.php?username={username}&password={password}"
+            
+            logging.info(f"Loading Xtream Codes: {base_url}")
+            self.load_m3u_from_url(playlist_url)
+            
+            # Override EPG
+            self.epg_urls = [epg_url]
+            self.settings.setValue("epg_urls", self.epg_urls)
+            QMessageBox.information(self, "Xtream Codes", "Playlist loaded and EPG configured.")
 
     def merge_m3u(self):
         file_name, _ = QFileDialog.getOpenFileName(self, "Merge M3U File", "", "M3U Files (*.m3u *.m3u8);;All Files (*)")
@@ -2692,9 +2899,13 @@ class M3UEditorWindow(QMainWindow):
             self.group_combo.setCurrentText(current)
         self.group_combo.blockSignals(False)
 
+    def on_group_combo_changed(self, text):
+        self.filter_table()
+
     def filter_table(self):
         self.proxy_model.filter_text = self.search_bar.text()
         self.proxy_model.filter_group = self.group_combo.currentText()
+        self.proxy_model.filter_health = self.health_combo.currentText()
         self.proxy_model.invalidateFilter()
 
     def bulk_edit_group(self):
@@ -2719,6 +2930,37 @@ class M3UEditorWindow(QMainWindow):
             self.update_group_combo()
             self.set_modified(True)
             self.log_action(f"Bulk edited group for {len(rows)} items")
+
+    def bulk_edit_attributes(self):
+        selected_indices = self.get_selected_rows()
+        if not selected_indices:
+            QMessageBox.warning(self, "Warning", "No channels selected.")
+            return
+            
+        dlg = BulkEditDialog(self)
+        if dlg.exec():
+            updates = dlg.get_updates()
+            if not updates:
+                return
+                
+            self.create_backup("bulk_edit")
+            self.save_undo_state()
+            
+            rows = [self.proxy_model.mapToSource(idx).row() for idx in selected_indices]
+            count = 0
+            
+            for row in rows:
+                if 0 <= row < len(self.entries):
+                    entry = self.entries[row]
+                    for attr, value in updates.items():
+                        if hasattr(entry, attr):
+                            setattr(entry, attr, value)
+                    count += 1
+            
+            self.refresh_table(clear_cache=False)
+            self.update_group_combo()
+            self.set_modified(True)
+            self.log_action(f"Bulk edited attributes for {count} items")
 
     def batch_edit_user_agent(self):
         selected_indices = self.get_selected_rows()
@@ -2881,6 +3123,9 @@ class M3UEditorWindow(QMainWindow):
         if row_index < len(self.entries):
             entry = self.entries[row_index]
             self.model.validation_data[id(entry)] = (color, message, is_valid)
+            entry.health_status = message
+            if not self.is_modified:
+                self.set_modified(True)
             self.model.dataChanged.emit(self.model.index(row_index, 0), self.model.index(row_index, 2))
 
     def on_validation_complete(self):
@@ -3028,34 +3273,42 @@ class M3UEditorWindow(QMainWindow):
         self.status_label.setText(f"EPG Parsed: {count} channels found.")
         self.btn_stop.setEnabled(False)
         
-        if not epg_map:
+        if not epg_map or "channels" not in epg_map:
             return
             
         self.save_undo_state()
         matched = 0
         
+        # Build lookup map: Name (lower) -> Data
+        # epg_map["channels"] is ID -> {name, logo}
+        name_lookup = {}
+        for ch_id, data in epg_map["channels"].items():
+            name = data["name"]
+            if name:
+                name_lookup[name.lower()] = {"id": ch_id, "logo": data["logo"], "name": name}
+        
+        epg_names = list(name_lookup.keys())
+        
         # Match entries
         for entry in self.entries:
-            # Simple matching by name (case-insensitive)
-            # Could be improved with fuzzy matching
-            name_key = entry.name.strip()
+            name_key = entry.name.strip().lower()
             
-            # Try exact match first, then case insensitive
-            data = epg_map.get(name_key)
-            if not data:
-                # Try finding case-insensitive match in keys
-                # This is slow for large lists, but acceptable for typical playlist sizes
-                for k, v in epg_map.items():
-                    if k.lower() == name_key.lower():
-                        data = v
-                        break
+            # 1. Exact/Case-Insensitive Match
+            match_data = name_lookup.get(name_key)
             
-            if data:
+            # 2. Fuzzy Match (if no exact match)
+            if not match_data:
+                # Find close matches with 85% similarity cutoff
+                matches = difflib.get_close_matches(name_key, epg_names, n=1, cutoff=0.85)
+                if matches:
+                    match_data = name_lookup[matches[0]]
+            
+            if match_data:
                 if not entry.tvg_id:
-                    entry.tvg_id = data['id']
+                    entry.tvg_id = match_data['id']
                     matched += 1
-                if not entry.logo and data['logo']:
-                    entry.logo = data['logo']
+                if not entry.logo and match_data['logo']:
+                    entry.logo = match_data['logo']
         
         self.refresh_table()
         QMessageBox.information(self, "Success", f"Updated {matched} channels with EPG data.")
@@ -3423,28 +3676,34 @@ class M3UEditorWindow(QMainWindow):
         self.anim.setEasingCurve(QEasingCurve.Type.OutQuad)
         self.anim.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
 
-    def add_to_favorites(self):
+    def toggle_favorites_filter(self, checked):
+        self.proxy_model.show_favorites_only = checked
+        self.proxy_model.invalidateFilter()
+
+    def toggle_favorite(self):
         selected_rows = self.table.selectionModel().selectedRows()
-        if not selected_rows:
-            return
+        if not selected_rows: return
             
         self.save_undo_state()
+        count = 0
         for index in selected_rows:
             source_index = self.proxy_model.mapToSource(index)
             row = source_index.row()
             entry = self.entries[row]
-            entry.group = "Favorites"
+            entry.favorite = not entry.favorite
+            count += 1
+            self.model.dataChanged.emit(source_index, source_index, [Qt.ItemDataRole.DisplayRole])
             
-        self.refresh_table()
-        self.update_group_combo()
-        QMessageBox.information(self, "Success", "Added selected channels to Favorites.")
-        self.log_action(f"Added {len(selected_rows)} channels to Favorites")
+        # self.refresh_table() # Not needed, dataChanged handles it
+        # self.update_group_combo() # Not needed as group didn't change
+        self.set_modified(True)
+        self.log_action(f"Toggled favorites for {count} channels")
 
     def show_context_menu(self, position):
         menu = QMenu()
         
-        fav_action = QAction("Add to Favorites", self)
-        fav_action.triggered.connect(self.add_to_favorites)
+        fav_action = QAction("Toggle Favorite", self)
+        fav_action.triggered.connect(self.toggle_favorite)
         menu.addAction(fav_action)
         
         edit_group_action = QAction("Edit Group", self)
