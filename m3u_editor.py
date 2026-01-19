@@ -46,7 +46,7 @@ try:
 except ImportError:
     HAS_TRANSLATOR = False
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # Suppress urllib3 SSL warnings on macOS/LibreSSL
 try:
@@ -110,6 +110,8 @@ class M3UEntry:
     user_agent: str = ""
     favorite: bool = False
     health_status: str = ""
+    locked: bool = False
+    validation_history: List[Any] = field(default_factory=list) # List of (timestamp, is_valid)
     raw_extinf: str = ""  # Keep original attributes to preserve unedited data
 
     def to_m3u_string(self) -> str:
@@ -130,6 +132,8 @@ class M3UEntry:
             attributes.append('tvg-fav="1"')
         if self.health_status:
             attributes.append(f'tvg-health="{self.health_status}"')
+        if self.locked:
+            attributes.append('tvg-locked="1"')
         
         # You can add more specific tvg- tags here if needed
         attr_str = " ".join(attributes)
@@ -167,6 +171,7 @@ class M3UParser:
                 duration=e.get("duration", "-1"),
                 favorite=(e.get("tvg_fav", "0") == "1"),
                 health_status=e.get("tvg_health", ""),
+                locked=(e.get("tvg_locked", "0") == "1"),
                 user_agent=e.get("user_agent", ""),
                 raw_extinf=e.get("raw_extinf", "")
             )
@@ -1026,6 +1031,38 @@ class FindReplaceDialog(QDialog):
     def get_data(self):
         return (self.find_input.text(), self.replace_input.text(), 
                 self.field_combo.currentText(), self.case_check.isChecked())
+
+class PinDialog(QDialog):
+    def __init__(self, parent=None, set_mode=False):
+        super().__init__(parent)
+        self.setWindowTitle("Parental Control")
+        self.resize(300, 150)
+        self.set_mode = set_mode
+        
+        layout = QVBoxLayout(self)
+        
+        lbl = QLabel("Enter New PIN:" if set_mode else "Enter PIN to unlock:")
+        layout.addWidget(lbl)
+        
+        self.pin_edit = QLineEdit()
+        self.pin_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        layout.addWidget(self.pin_edit)
+        
+        if set_mode:
+            layout.addWidget(QLabel("Confirm PIN:"))
+            self.confirm_edit = QLineEdit()
+            self.confirm_edit.setEchoMode(QLineEdit.EchoMode.Password)
+            layout.addWidget(self.confirm_edit)
+            
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+        
+    def get_pin(self):
+        if self.set_mode:
+            return self.pin_edit.text(), self.confirm_edit.text()
+        return self.pin_edit.text()
 
 class BatchRenameDialog(QDialog):
     def __init__(self, parent=None):
@@ -3048,6 +3085,56 @@ class EPGSelectionDialog(QDialog):
             
         return urls
 
+class HistoryChartWidget(QWidget):
+    def __init__(self, history_data, parent=None):
+        super().__init__(parent)
+        self.history = history_data # list of (timestamp, is_valid)
+        self.setMinimumSize(300, 150)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        rect = self.rect()
+        w = rect.width()
+        h = rect.height()
+        
+        # Background
+        painter.fillRect(rect, QColor("#181825"))
+        
+        if not self.history:
+            painter.setPen(QColor("#6c7086"))
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "No History Data")
+            return
+            
+        # Draw timeline
+        # X axis: time, Y axis: status (0 or 1)
+        # We'll draw bars for each check
+        
+        count = len(self.history)
+        bar_width = w / max(count, 10) # Min 10 slots width
+        
+        # Sort by time just in case
+        sorted_hist = sorted(self.history, key=lambda x: x[0])
+        
+        for i, (ts, is_valid) in enumerate(sorted_hist):
+            x = i * bar_width
+            
+            if is_valid:
+                color = QColor("#a6e3a1") # Green
+                bar_h = h * 0.8
+                y = h - bar_h
+            else:
+                color = QColor("#f38ba8") # Red
+                bar_h = h * 0.4 # Shorter bar for failure
+                y = h - bar_h
+                
+            painter.fillRect(QRectF(x + 2, y, bar_width - 4, bar_h), color)
+            
+        # Draw baseline
+        painter.setPen(QColor("#45475a"))
+        painter.drawLine(0, h-1, w, h-1)
+
 class SimpleChartWidget(QWidget):
     def __init__(self, data, parent=None):
         super().__init__(parent)
@@ -3102,6 +3189,7 @@ class StatisticsDialog(QDialog):
         self.create_health_tab()
         self.create_language_tab()
         self.create_latency_tab()
+        self.create_history_tab()
         
         btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         btn_box.rejected.connect(self.reject)
@@ -3199,6 +3287,35 @@ class StatisticsDialog(QDialog):
             counts[found_lang] = counts.get(found_lang, 0) + 1
         
         self.tabs.addTab(self.create_tab_content(counts, ["Language", "Count", "Distribution"]), "Language")
+
+    def create_history_tab(self):
+        # Find channel with most history to show as example or aggregate
+        # For this view, let's show a list of channels that have history
+        
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        
+        has_history = False
+        for entry in self.entries:
+            if entry.validation_history:
+                has_history = True
+                lbl = QLabel(f"{entry.name} ({len(entry.validation_history)} checks)")
+                chart = HistoryChartWidget(entry.validation_history)
+                content_layout.addWidget(lbl)
+                content_layout.addWidget(chart)
+                
+        if not has_history:
+            content_layout.addWidget(QLabel("No validation history available yet."))
+            
+        content_layout.addStretch()
+        scroll.setWidget(content)
+        layout.addWidget(scroll)
+        self.tabs.addTab(container, "History")
 
     def create_latency_tab(self):
         # Parse latencies from names (format: "Name [123ms]")
@@ -4387,6 +4504,154 @@ QScrollBar::handle:vertical {{ background: {theme['border']}; min-height: 20px; 
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}
 """
 
+TV_STYLESHEET = """
+/* TV Mode Stylesheet - High Contrast & Large Fonts */
+QMainWindow, QWidget { background-color: #000000; color: #ffffff; font-family: %FONT%; font-size: 16pt; }
+
+QPushButton {
+    background-color: #222222;
+    border: 3px solid #444444;
+    border-radius: 12px;
+    padding: 12px 24px;
+    font-weight: bold;
+    min-height: 40px;
+}
+QPushButton:hover, QPushButton:focus {
+    background-color: #444444;
+    border-color: #00ff00; /* High contrast focus */
+    color: #00ff00;
+}
+
+QTableView, QListView {
+    background-color: #111111;
+    color: #ffffff;
+    selection-background-color: #00ff00;
+    selection-color: #000000;
+    font-size: 18pt;
+    outline: none;
+}
+QTableView::item { padding: 10px; }
+
+QHeaderView::section {
+    background-color: #333333;
+    color: #ffffff;
+    font-size: 16pt;
+    padding: 12px;
+    border: none;
+}
+
+QLineEdit, QComboBox {
+    background-color: #222222;
+    border: 2px solid #666666;
+    border-radius: 8px;
+    padding: 10px;
+    color: #ffffff;
+    font-size: 16pt;
+}
+QLineEdit:focus, QComboBox:focus {
+    border-color: #00ff00;
+}
+
+QScrollBar:vertical { width: 25px; background: #111111; }
+QScrollBar::handle:vertical { background: #666666; border-radius: 10px; }
+""".replace("%FONT%", APP_FONT)
+
+class FirstRunWizard(QDialog):
+    def __init__(self, settings, parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self.setWindowTitle("Welcome to M3U Editor")
+        self.resize(600, 450)
+        
+        self.layout = QVBoxLayout(self)
+        self.stack = QStackedWidget()
+        self.layout.addWidget(self.stack)
+        
+        # Page 1: Welcome
+        p1 = QWidget()
+        l1 = QVBoxLayout(p1)
+        l1.addWidget(QLabel("<h1>Welcome!</h1><p>Thank you for installing Open Source M3U Editor.</p><p>Let's set up your environment for the best experience.</p>"))
+        l1.addStretch()
+        self.stack.addWidget(p1)
+        
+        # Page 2: VLC
+        p2 = QWidget()
+        l2 = QVBoxLayout(p2)
+        l2.addWidget(QLabel("<h2>VLC Media Player</h2><p>Path to VLC executable (required for external playback):</p>"))
+        self.vlc_edit = QLineEdit(self.settings.value("vlc_path", ""))
+        btn_browse = QPushButton("Browse")
+        btn_browse.clicked.connect(self.browse_vlc)
+        h2 = QHBoxLayout()
+        h2.addWidget(self.vlc_edit)
+        h2.addWidget(btn_browse)
+        l2.addLayout(h2)
+        l2.addStretch()
+        self.stack.addWidget(p2)
+        
+        # Page 3: EPG
+        p3 = QWidget()
+        l3 = QVBoxLayout(p3)
+        l3.addWidget(QLabel("<h2>EPG Sources</h2><p>Select default EPG sources to preload:</p>"))
+        self.epg_checks = []
+        presets = [
+            ("Global Entertainment (PlutoTV)", "https://i.mjh.nz/PlutoTV/all.xml"),
+            ("Indian Channels (Samsung TV+)", "https://i.mjh.nz/SamsungTVPlus/in.xml"),
+            ("US News/Sports (Samsung TV+)", "https://i.mjh.nz/SamsungTVPlus/us.xml"),
+            ("Global Sports (IPTV-Org)", "https://iptv-org.github.io/epg/guides/int.xml")
+        ]
+        current_urls = self.settings.value("epg_urls", [], type=list)
+        for name, url in presets:
+            cb = QCheckBox(name)
+            if url in current_urls: cb.setChecked(True)
+            self.epg_checks.append((cb, url))
+            l3.addWidget(cb)
+        l3.addStretch()
+        self.stack.addWidget(p3)
+        
+        # Navigation Buttons
+        btn_layout = QHBoxLayout()
+        self.btn_back = QPushButton("Back")
+        self.btn_next = QPushButton("Next")
+        self.btn_back.clicked.connect(self.go_back)
+        self.btn_next.clicked.connect(self.go_next)
+        btn_layout.addWidget(self.btn_back)
+        btn_layout.addWidget(self.btn_next)
+        self.layout.addLayout(btn_layout)
+        
+        self.update_buttons()
+
+    def browse_vlc(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select VLC Executable")
+        if path: self.vlc_edit.setText(path)
+
+    def go_back(self):
+        c = self.stack.currentIndex()
+        if c > 0:
+            self.stack.setCurrentIndex(c - 1)
+        self.update_buttons()
+
+    def go_next(self):
+        c = self.stack.currentIndex()
+        if c < self.stack.count() - 1:
+            self.stack.setCurrentIndex(c + 1)
+        else:
+            self.finish()
+        self.update_buttons()
+
+    def update_buttons(self):
+        c = self.stack.currentIndex()
+        self.btn_back.setEnabled(c > 0)
+        self.btn_next.setText("Finish" if c == self.stack.count() - 1 else "Next")
+
+    def finish(self):
+        # Save settings
+        self.settings.setValue("vlc_path", self.vlc_edit.text())
+        urls = [url for cb, url in self.epg_checks if cb.isChecked()]
+        if urls:
+            self.settings.setValue("epg_urls", urls)
+        self.settings.setValue("first_run_completed", True)
+        self.accept()
+
 class M3UEditorWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -4407,6 +4672,7 @@ class M3UEditorWindow(QMainWindow):
         self.is_modified = False
         self.editing_started = False
         self.is_dark_mode = True # Default to dark mode for "fancy" look
+        self.is_tv_mode = False
         self.current_theme = DEFAULT_THEME.copy()
         self.settings = QSettings("OpenSource", "M3UEditor")
         self.recent_files = self.settings.value("recent_files", [], type=list)
@@ -4481,6 +4747,10 @@ class M3UEditorWindow(QMainWindow):
              self.last_backup_time = QDateTime.currentDateTime()
         self.last_epg_run_date = self.settings.value("scheduler/last_epg_date", "")
         self.last_val_run_date = self.settings.value("scheduler/last_val_date", "")
+
+        # Check first run
+        if not self.settings.value("first_run_completed", False, type=bool):
+            QTimer.singleShot(100, self.open_first_run_wizard)
 
     def load_language_patterns(self):
         saved = self.settings.value("language_patterns", {})
@@ -4923,6 +5193,10 @@ class M3UEditorWindow(QMainWindow):
         ua_mgr_action.triggered.connect(self.open_user_agent_manager)
         tools_menu.addAction(ua_mgr_action)
         
+        pin_action = QAction("Set Parental PIN...", self)
+        pin_action.triggered.connect(self.set_parental_pin)
+        tools_menu.addAction(pin_action)
+        
         lang_mgr_action = QAction("Language Manager...", self)
         lang_mgr_action.triggered.connect(self.open_language_manager)
         tools_menu.addAction(lang_mgr_action)
@@ -5046,6 +5320,11 @@ class M3UEditorWindow(QMainWindow):
         theme_editor_action.triggered.connect(self.open_theme_editor)
         view_menu.addAction(theme_editor_action)
         
+        tv_mode_action = QAction("TV Mode Interface", self)
+        tv_mode_action.setShortcut("F10")
+        tv_mode_action.triggered.connect(self.toggle_tv_mode)
+        view_menu.addAction(tv_mode_action)
+        
         iptv_action = QAction("Theater Mode", self)
         iptv_action.setShortcut("F11")
         iptv_action.triggered.connect(self.open_iptv_player)
@@ -5128,6 +5407,39 @@ class M3UEditorWindow(QMainWindow):
         self.status_label.setText("Ready")
         self.log_action("Closed file")
         return True
+
+    def check_pin(self):
+        """Prompts for PIN if set. Returns True if correct or not set."""
+        saved_pin = self.settings.value("parental_pin", "")
+        if not saved_pin:
+            return True
+            
+        dlg = PinDialog(self)
+        if dlg.exec():
+            entered_pin = dlg.get_pin()
+            # Simple hash check (in real app use proper hashing)
+            if hashlib.sha256(entered_pin.encode()).hexdigest() == saved_pin:
+                return True
+            else:
+                QMessageBox.warning(self, "Access Denied", "Incorrect PIN.")
+                return False
+        return False
+
+    def set_parental_pin(self):
+        dlg = PinDialog(self, set_mode=True)
+        if dlg.exec():
+            pin, confirm = dlg.get_pin()
+            if pin != confirm:
+                QMessageBox.warning(self, "Error", "PINs do not match.")
+                return
+            
+            if not pin:
+                self.settings.setValue("parental_pin", "")
+                QMessageBox.information(self, "Success", "Parental PIN removed.")
+            else:
+                hashed = hashlib.sha256(pin.encode()).hexdigest()
+                self.settings.setValue("parental_pin", hashed)
+                QMessageBox.information(self, "Success", "Parental PIN set.")
 
     def stop_background_tasks(self):
         """Stops all pending background tasks."""
@@ -6233,6 +6545,10 @@ class M3UEditorWindow(QMainWindow):
             
         if row_index < len(self.entries):
             entry = self.entries[row_index]
+            
+            # Update History
+            entry.validation_history.append((time.time(), is_valid))
+            
             self.model.validation_data[id(entry)] = (color, message, is_valid)
             entry.health_status = message
             if not self.is_modified:
@@ -7066,6 +7382,22 @@ class M3UEditorWindow(QMainWindow):
             app.setStyleSheet("") # Revert to default Fusion/System style
             app.setStyle("Fusion")
 
+    def toggle_tv_mode(self):
+        self.is_tv_mode = not self.is_tv_mode
+        if self.is_tv_mode:
+            # Apply TV stylesheet
+            QApplication.instance().setStyleSheet(TV_STYLESHEET)
+            # Switch to grid view for better remote navigation
+            if self.view_stack.currentIndex() == 0:
+                self.toggle_view_mode()
+            self.showFullScreen()
+            self.status_label.setText("TV Mode Enabled (Press F10 to exit)")
+        else:
+            # Revert to normal theme
+            self.apply_theme(self.current_theme)
+            self.showNormal()
+            self.status_label.setText("TV Mode Disabled")
+
     def open_theme_editor(self):
         dlg = ThemeEditorDialog(self.current_theme, self)
         if dlg.exec():
@@ -7101,6 +7433,10 @@ class M3UEditorWindow(QMainWindow):
         self.proxy_model.invalidateFilter()
 
     def toggle_favorite(self):
+        # Check PIN if any selected item is locked? 
+        # Usually favoriting doesn't require PIN, but let's leave it open.
+        pass
+        
         selected_rows = self.table.selectionModel().selectedRows()
         if not selected_rows: return
             
@@ -7119,12 +7455,34 @@ class M3UEditorWindow(QMainWindow):
         self.set_modified(True)
         self.log_action(f"Toggled favorites for {count} channels")
 
+    def toggle_lock(self):
+        if not self.check_pin(): return
+        
+        selected_rows = self.get_selected_rows()
+        if not selected_rows: return
+        
+        self.save_undo_state()
+        count = 0
+        for index in selected_rows:
+            source_index = self.proxy_model.mapToSource(index)
+            row = source_index.row()
+            entry = self.entries[row]
+            entry.locked = not entry.locked
+            count += 1
+            
+        self.set_modified(True)
+        self.log_action(f"Toggled lock for {count} channels")
+
     def show_context_menu(self, position):
         menu = QMenu()
         
         fav_action = QAction("Toggle Favorite", self)
         fav_action.triggered.connect(self.toggle_favorite)
         menu.addAction(fav_action)
+        
+        lock_action = QAction("Lock/Unlock Channel", self)
+        lock_action.triggered.connect(self.toggle_lock)
+        menu.addAction(lock_action)
         
         edit_group_action = QAction("Edit Group", self)
         edit_group_action.triggered.connect(self.bulk_edit_group)
@@ -7181,6 +7539,10 @@ class M3UEditorWindow(QMainWindow):
         entry = self.entries[source_index.row()]
         if not entry:
             return
+            
+        if entry.locked:
+            if not self.check_pin():
+                return
 
         # Check settings first
         vlc_cmd = self.settings.value("vlc_path", "")
@@ -7220,6 +7582,10 @@ class M3UEditorWindow(QMainWindow):
         # Find the index of the selected row in the visible list
         current_index = selected_rows[0].row()
         
+        entry = visible_entries[current_index]
+        if entry.locked:
+            if not self.check_pin(): return
+        
         dlg = StreamPreviewDialog(visible_entries, current_index, self)
         dlg.exec()
 
@@ -7236,6 +7602,10 @@ class M3UEditorWindow(QMainWindow):
         selected = self.get_selected_rows()
         if selected:
             idx = self.proxy_model.mapToSource(selected[0]).row()
+            
+        entry = self.entries[idx]
+        if entry.locked:
+            if not self.check_pin(): return
             
         self.iptv_window = IPTVPlayerWindow(self.entries, idx, self)
         self.iptv_window.setWindowTitle("Theater Mode")
@@ -7492,6 +7862,10 @@ class M3UEditorWindow(QMainWindow):
             
         idx = self.proxy_model.mapToSource(selected_rows[0])
         entry = self.entries[idx.row()]
+        
+        if entry.locked:
+            if not self.check_pin(): return
+            
         dlg = CastDialog(entry.url, self, stream_name=entry.name)
         dlg.exec()
 
@@ -7601,6 +7975,12 @@ class M3UEditorWindow(QMainWindow):
     def open_task_scheduler(self):
         dlg = TaskSchedulerDialog(self.settings, self)
         dlg.exec()
+
+    def open_first_run_wizard(self):
+        dlg = FirstRunWizard(self.settings, self)
+        if dlg.exec():
+            # Reload settings if needed
+            self.epg_urls = self.settings.value("epg_urls", [], type=list)
 
     def check_scheduled_tasks(self):
         now = QDateTime.currentDateTime()
