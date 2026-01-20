@@ -61,6 +61,7 @@ A robust, cross-platform GUI application built with Python and PyQt6 for managin
 *   **EPG Integration**: Load XMLTV EPGs (supports .gz/.xz), cache locally, and view program schedules.
 *   **Task Scheduler**: Automate backups, EPG updates, and playlist validation.
 *   **Plugin System**: Extend functionality with external Python scripts.
+*   **Version Control**: Track playlist changes with a local Git repository.
 
 ### 🎨 UI & Customization
 *   **Theme Editor**: Customize application colors and save themes.
@@ -69,6 +70,7 @@ A robust, cross-platform GUI application built with Python and PyQt6 for managin
 *   **Global Search**: Filter playlist by Name, Group, URL, or EPG ID.
 *   **Language Column**: Display and filter channels by detected language.
 *   **Virtual List View**: Efficient handling of large playlists (10k+ channels).
+*   **Network Monitor**: Real-time bandwidth usage display in the status bar.
 
 ## Demo
 
@@ -122,7 +124,7 @@ pip install PyQt6 pychromecast qrcode[pil] deep-translator
 1.  **Launch**: Run the application via the executable or `python m3u_editor.py`.
 2.  **First Run**: Follow the wizard to configure your VLC path and default EPG sources.
 
-### Menu Guide
+### Menu & Feature Guide
 
 #### **File Menu**
 *   **New**: Create a blank playlist.
@@ -135,6 +137,7 @@ pip install PyQt6 pychromecast qrcode[pil] deep-translator
 *   **Save M3U**: Save changes to the current file.
 *   **Save with Encoding**: Save with a specific character encoding (e.g., UTF-8, Latin-1).
 *   **Restore Backup**: Revert to a previous state from an auto-generated zip backup.
+*   **Close File**: Close the current playlist and clear the workspace.
 *   **Export to CSV**: Export the playlist metadata to a spreadsheet-compatible format.
 
 #### **Edit Menu**
@@ -184,11 +187,44 @@ pip install PyQt6 pychromecast qrcode[pil] deep-translator
     *   **Quick Translate**: Translate channel names.
     *   **Transcode Wizard**: Convert streams to MP4/MKV.
     *   **Schedule Recording**: Record streams at a set time.
+    *   **Manage Recordings**: View and cancel pending recording tasks.
     *   **Playlist Diff Tool**: Compare two playlists.
     *   **Snapshot Gallery**: View captured video frames.
     *   **Update EPG Data**: Refresh XMLTV data.
     *   **Task Scheduler**: Automate backups and checks.
-    *   **Version History**: View Git commit history of the playlist.
+    *   **Version History**: View local Git commit history of playlist changes.
+*   **Set Parental PIN**: Lock channels or groups with a PIN code.
+*   **Settings**: Configure VLC path, FFmpeg path, and clear caches.
+
+#### **Plugins Menu**
+*   **Reload Plugins**: Refresh the list of available scripts from the `plugins/` folder.
+*   **Open Plugins Folder**: Open the directory where custom Python scripts are stored.
+*   *(Loaded Plugins)*: Custom actions defined by external scripts.
+
+#### **Help Menu**
+*   **Documentation**: Open the online documentation.
+*   **Check for Updates**: Check for the latest version on GitHub.
+*   **About**: View application version and credits.
+
+### Keyboard Shortcuts
+
+| Action | Shortcut |
+| :--- | :--- |
+| **New File** | `Ctrl+N` |
+| **Save File** | `Ctrl+S` |
+| **Close File** | `Ctrl+W` |
+| **Undo** | `Ctrl+Z` |
+| **Redo** | `Ctrl+Y` |
+| **Find & Replace** | `Ctrl+F` |
+| **Toggle View (Grid/List)** | `Ctrl+G` |
+| **TV Mode** | `F10` |
+| **Theater Mode** | `F11` |
+
+#### Global Hotkeys (Background)
+These shortcuts work even when the application is minimized or not in focus:
+*   `Ctrl+Alt+P`: Play/Pause active stream (Preview, Theater Mode, or Cast).
+*   `Ctrl+Alt+M`: Mute/Unmute audio.
+*   `Ctrl+Alt+H`: Show/Hide the application window.
 
 ### Quick Actions
 *   **Right-Click**: Access context menus for playing, editing, or locking channels.
