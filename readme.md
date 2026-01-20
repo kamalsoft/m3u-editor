@@ -118,19 +118,89 @@ pip install PyQt6 pychromecast qrcode[pil] deep-translator
 
 ## Usage
 
-1.  **Run the application**:
-    ```bash
-    python m3u_editor.py
-    ```
-2.  **Load**: 
-    *   Click **Load M3U** for local files or **Load URL** for web playlists.
-    *   Use the **Reload** button to refresh the current source.
-3.  **Edit**: Select a channel to modify its details in the right panel, or edit the **Group** directly in the **Stream Preview**.
-4.  **Security Audit**: Click **Security Audit** in the toolbar to scan selected or all streams for potential threats.
-5.  **Smart Grouping**: Use the **Smart Grouping** feature to automatically categorize channels based on their names.
-6.  **Manage Groups**: Use the **Manage Groups** button to perform bulk group operations.
-7.  **Save**: Click the **Save** button (enabled when changes are made to local files) to persist your work. Modified files are marked with an asterisk (*) in the title bar.
-8.  **Settings**: Configure VLC path and clear local EPG cache via the **Tools > Settings** menu.
+### Getting Started
+1.  **Launch**: Run the application via the executable or `python m3u_editor.py`.
+2.  **First Run**: Follow the wizard to configure your VLC path and default EPG sources.
+
+### Menu Guide
+
+#### **File Menu**
+*   **New**: Create a blank playlist.
+*   **Load M3U File**: Open a local `.m3u` or `.m3u8` file.
+*   **Load from URL**: Download a playlist directly from a web link.
+*   **Load from Xtream Codes**: Login to an IPTV provider using Host, Username, and Password.
+*   **Load from Stalker Portal**: Login using a Portal URL and MAC Address.
+*   **Merge Playlist**: Import channels from another M3U file into the current one (Append, Replace, or Deduplicate).
+*   **Cloud Sync**: Save/Load playlists to a local folder synced with Google Drive/Dropbox.
+*   **Save M3U**: Save changes to the current file.
+*   **Save with Encoding**: Save with a specific character encoding (e.g., UTF-8, Latin-1).
+*   **Restore Backup**: Revert to a previous state from an auto-generated zip backup.
+*   **Export to CSV**: Export the playlist metadata to a spreadsheet-compatible format.
+
+#### **Edit Menu**
+*   **Undo/Redo**: Revert or re-apply changes.
+*   **Find and Replace**: Search for text in specific fields (Name, URL, Group) and replace it.
+*   **Batch Rename (Regex)**: Use Regular Expressions to rename channels in bulk.
+*   **Bulk Edit Attributes**: Modify specific attributes (Group, Logo, EPG ID) for all selected channels at once.
+
+#### **View Menu**
+*   **Toggle Dark Mode**: Switch between Light and Dark themes.
+*   **Toggle Grid/List View**: Switch the main view between a detailed table and a visual grid of icons.
+*   **Theme Editor**: Customize the application's color palette.
+*   **TV Mode Interface**: Switch to a high-contrast, large-font interface for TV usage.
+*   **Theater Mode**: Open the dedicated full-screen IPTV player.
+
+#### **Tools Menu**
+*   **Deduplication**:
+    *   **Find Duplicates**: Locate exact URL duplicates.
+    *   **Find Name Duplicates**: Locate channels with the same name but different URLs.
+    *   **Fuzzy Finder**: Find similar names (e.g., "HD" vs "FHD").
+    *   **Smart Dedupe**: Auto-remove duplicates keeping the best quality entry.
+*   **Organization**:
+    *   **Smart Grouping**: Auto-categorize channels into Sports, Movies, etc.
+    *   **Add Country Flags**: Detect countries in names and prepend flags to groups.
+    *   **Channel Numbering**: Renumber channels or add prefixes.
+    *   **Split Playlist**: Save each group as a separate M3U file.
+    *   **Favorites Manager**: Reorder and rename favorite channels.
+    *   **User-Agent Manager**: Apply User-Agents to specific groups.
+    *   **Language Manager**: Customize language detection patterns.
+*   **Logos**:
+    *   **Scrape Missing Logos**: Search Google Images for missing icons.
+    *   **Channel Logo Wizard**: Match logos from a repository URL.
+*   **Diagnostics**:
+    *   **Channel Statistics**: View charts of group/resolution distribution.
+    *   **Check Resolutions**: Detect SD/HD/4K quality for streams.
+    *   **Check Stream Latency**: Measure response time.
+    *   **Stream Diagnostics**: Detailed FFprobe analysis of a stream.
+    *   **Stream Bitrate Analyzer**: Measure real-time bitrate.
+    *   **Live Stream Monitor**: Watch status of multiple streams.
+    *   **Remove Invalid Streams**: Delete streams that failed the Health Check.
+    *   **Auto-Repair**: Attempt to fix broken URLs (http/https swap).
+*   **Network & Casting**:
+    *   **Network Stream Scanner**: Find DLNA/UPnP devices.
+    *   **Cast Manager**: Control active casting sessions.
+    *   **Network Speed Test**: Test internet download speed.
+*   **Utilities**:
+    *   **Quick Translate**: Translate channel names.
+    *   **Transcode Wizard**: Convert streams to MP4/MKV.
+    *   **Schedule Recording**: Record streams at a set time.
+    *   **Playlist Diff Tool**: Compare two playlists.
+    *   **Snapshot Gallery**: View captured video frames.
+    *   **Update EPG Data**: Refresh XMLTV data.
+    *   **Task Scheduler**: Automate backups and checks.
+    *   **Version History**: View Git commit history of the playlist.
+
+### Quick Actions
+*   **Right-Click**: Access context menus for playing, editing, or locking channels.
+*   **Drag & Drop**: Move rows to reorder channels (in Table View).
+*   **Double-Click**: Edit a cell directly or play a stream (depending on column).
+
+### CLI Usage
+
+You can also launch the editor with a file directly:
+```bash
+python m3u_editor.py "path/to/playlist.m3u"
+```
 
 
 ## Security & Privacy

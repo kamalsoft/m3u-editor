@@ -47,6 +47,18 @@ try:
 except ImportError:
     HAS_TRANSLATOR = False
 
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
+try:
+    import keyboard
+    HAS_KEYBOARD = True
+except ImportError:
+    HAS_KEYBOARD = False
+
 from dataclasses import dataclass, field
 
 # Suppress urllib3 SSL warnings on macOS/LibreSSL
@@ -149,6 +161,17 @@ class M3UEntry:
         lines.append(self.url)
         return "\n".join(lines)
 
+@dataclass
+class RecordingTask:
+    """Represents a scheduled recording task."""
+    name: str
+    url: str
+    start_time: QDateTime
+    duration: int
+    output_path: str
+    status: str = "Pending"
+    timer: QTimer = None
+
 # -----------------------------------------------------------------------------
 # Logic / Controller
 # -----------------------------------------------------------------------------
@@ -187,7 +210,6 @@ class M3UParser:
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                 return M3UParser.parse_lines(f)
         except Exception as e:
-            print(f"Error parsing file: {e}")
             logging.error(f"Error parsing file: {e}", exc_info=True)
             raise e
 
@@ -211,6 +233,55 @@ class M3UParser:
                     info['url-tvg'] = match.group(1)
                 break
         return info
+
+class GitVersionControl:
+    """Manages a local git repository for playlist versioning."""
+    def __init__(self, base_path):
+        self.repo_dir = os.path.join(base_path, "versions")
+        self.playlist_file = os.path.join(self.repo_dir, "playlist.m3u")
+        self.git_exe = shutil.which("git")
+        if self.git_exe:
+            self._init_repo()
+
+    def _run_git(self, args):
+        if not self.git_exe: return None
+        try:
+            # Run git command in the versions directory
+            creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+            return subprocess.check_output(
+                [self.git_exe] + args, 
+                cwd=self.repo_dir, 
+                stderr=subprocess.STDOUT, 
+                text=True,
+                creationflags=creationflags
+            )
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Git error: {e.output}")
+            return None
+        except Exception as e:
+            logging.error(f"Git execution error: {e}")
+            return None
+
+    def _init_repo(self):
+        if not os.path.exists(self.repo_dir):
+            os.makedirs(self.repo_dir)
+            self._run_git(["init"])
+            self._run_git(["config", "user.email", "m3ueditor@local"])
+            self._run_git(["config", "user.name", "M3U Editor"])
+
+    def commit_changes(self, entries):
+        if not self.git_exe: return
+        try:
+            M3UParser.save_file(self.playlist_file, entries)
+            self._run_git(["add", "playlist.m3u"])
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self._run_git(["commit", "-m", f"Auto-save: {timestamp}"])
+        except Exception as e:
+            logging.error(f"Version control commit failed: {e}")
+
+    def get_history(self):
+        if not self.git_exe: return "Git not found. Please install Git to use Version Control."
+        return self._run_git(["log", "--pretty=format:%h - %ad - %s", "--date=short", "-n", "50"]) or "No history available."
 
 class ValidationSignals(QObject):
     """Signals for the ValidationWorker."""
@@ -253,7 +324,7 @@ class ValidationWorker(QRunnable):
                     with urllib.request.urlopen(req, timeout=5) as response:
                         if 200 <= response.status < 400:
                             return True, f"OK ({response.status})"
-                except:
+                except Exception:
                     pass
             return False, f"HTTP {e.code}"
         except Exception as e:
@@ -317,8 +388,8 @@ class LogoScraperWorker(QRunnable):
                     # Filter for likely image hosting domains or google thumbnails
                     if 'gstatic.com' in m or 'googleusercontent.com' in m:
                         return m
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug(f"Logo scraping error for {name}: {e}")
         return None
 
 class EPGSignals(QObject):
@@ -360,8 +431,8 @@ class EPGWorker(QRunnable):
                             with open(cache_file, "rb") as f:
                                 raw_data = f.read()
                             self.signals.progress.emit(f"Loaded cached source {i+1}/{total_urls}...")
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logging.warning(f"Failed to read cache for {url}: {e}")
 
                 if not raw_data:
                     self.signals.progress.emit(f"Fetching source {i+1}/{total_urls}...")
@@ -518,8 +589,8 @@ class ResolutionWorker(QRunnable):
                         return f"{h}p"
                     except ValueError:
                         return output
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug(f"Resolution detection failed: {e}")
         return None
 
 class LatencySignals(QObject):
@@ -648,7 +719,7 @@ class RepairWorker(QRunnable):
                 with urllib.request.urlopen(req, timeout=5) as resp:
                     if 200 <= resp.status < 400:
                         return True
-            except:
+            except Exception:
                 pass
             return False
 
@@ -659,7 +730,7 @@ class RepairWorker(QRunnable):
                 if 200 <= resp.status < 400:
                     # If the URL changed (redirect), return the new one
                     return resp.geturl()
-        except:
+        except Exception:
             pass
 
         # 2. Protocol swap (HTTP <-> HTTPS)
@@ -1619,8 +1690,8 @@ class NetworkScannerWorker(QRunnable):
                         self.signals.found.emit(server, location)
                 except socket.timeout:
                     break
-                except Exception:
-                    pass
+                except Exception as e:
+                    logging.debug(f"SSDP receive error: {e}")
         except Exception as e:
             logging.error(f"SSDP Scan error: {e}")
         finally:
@@ -1970,7 +2041,8 @@ class CastManagerDialog(QDialog):
             # pychromecast volume is 0.0-1.0
             current_vol = cast.status.volume_level
             self.vol_slider.setValue(int(current_vol * 100))
-        except Exception:
+        except Exception as e:
+            logging.debug(f"Error getting volume: {e}")
             self.vol_slider.setValue(50)
         self.vol_slider.valueChanged.connect(self.set_volume)
         vol_layout.addWidget(self.vol_slider)
@@ -2028,7 +2100,8 @@ class CastManagerDialog(QDialog):
         if self.parent_window and self.parent_window.active_cast:
             try:
                 self.parent_window.active_cast.set_volume(value / 100.0)
-            except Exception:
+            except Exception as e:
+                logging.error(f"Failed to set volume: {e}")
                 pass
 
     def refresh_queue(self):
@@ -2240,7 +2313,7 @@ class CastDialog(QDialog):
             
             self.qr_label.setPixmap(pixmap.scaled(250, 250, Qt.AspectRatioMode.KeepAspectRatio))
         except Exception as e:
-            self.qr_label.setText(f"Error: {e}")
+            self.qr_label.setText(f"QR Generation Error: {e}")
 
     def start_scan(self):
         self.device_list.clear()
@@ -2835,7 +2908,8 @@ class StreamPreviewDialog(QDialog):
             else:
                 self.combo_audio.addItem("Default")
                 self.combo_audio.setEnabled(False)
-        except Exception:
+        except Exception as e:
+             logging.debug(f"Error updating audio tracks: {e}")
              self.combo_audio.addItem("Audio N/A")
              self.combo_audio.setEnabled(False)
         self.combo_audio.blockSignals(False)
@@ -2854,7 +2928,8 @@ class StreamPreviewDialog(QDialog):
             else:
                 self.combo_subs.addItem("No Subs")
                 self.combo_subs.setEnabled(False)
-        except Exception:
+        except Exception as e:
+             logging.debug(f"Error updating subtitle tracks: {e}")
              self.combo_subs.addItem("Subs N/A")
              self.combo_subs.setEnabled(False)
         self.combo_subs.blockSignals(False)
@@ -4265,6 +4340,76 @@ class ScheduledRecordingDialog(QDialog):
     def get_settings(self):
         return self.start_time.dateTime(), self.duration.value(), self.output_file
 
+class RecordingManagerDialog(QDialog):
+    def __init__(self, tasks, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Recording Scheduler")
+        self.resize(600, 400)
+        self.tasks = tasks
+        self.parent_window = parent
+        
+        layout = QVBoxLayout(self)
+        
+        self.table = QTableWidget()
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["Name", "Start Time", "Duration", "Status", "Output"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.table)
+        
+        self.refresh_table()
+        
+        btn_layout = QHBoxLayout()
+        btn_cancel = QPushButton("Cancel Selected Task")
+        btn_cancel.clicked.connect(self.cancel_task)
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.accept)
+        
+        btn_layout.addWidget(btn_cancel)
+        btn_layout.addWidget(btn_close)
+        layout.addLayout(btn_layout)
+
+    def refresh_table(self):
+        self.table.setRowCount(len(self.tasks))
+        for i, task in enumerate(self.tasks):
+            self.table.setItem(i, 0, QTableWidgetItem(task.name))
+            self.table.setItem(i, 1, QTableWidgetItem(task.start_time.toString("yyyy-MM-dd HH:mm:ss")))
+            self.table.setItem(i, 2, QTableWidgetItem(f"{task.duration} min"))
+            self.table.setItem(i, 3, QTableWidgetItem(task.status))
+            self.table.setItem(i, 4, QTableWidgetItem(os.path.basename(task.output_path)))
+
+    def cancel_task(self):
+        row = self.table.currentRow()
+        if row >= 0 and row < len(self.tasks):
+            task = self.tasks[row]
+            if task.timer and task.timer.isActive():
+                task.timer.stop()
+                task.status = "Cancelled"
+                self.refresh_table()
+                QMessageBox.information(self, "Cancelled", f"Task '{task.name}' cancelled.")
+            elif task.status == "Pending":
+                # If pending but timer not active (shouldn't happen logic-wise but safe to handle)
+                task.status = "Cancelled"
+                self.refresh_table()
+            else:
+                QMessageBox.information(self, "Info", "Task is not pending.")
+
+class VersionControlDialog(QDialog):
+    def __init__(self, history_text, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Version History (Git)")
+        self.resize(500, 400)
+        layout = QVBoxLayout(self)
+        
+        self.text_edit = QTextEdit()
+        self.text_edit.setReadOnly(True)
+        self.text_edit.setText(history_text)
+        layout.addWidget(self.text_edit)
+        
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.accept)
+        layout.addWidget(btn_close)
+
 class CustomizeToolbarDialog(QDialog):
     def __init__(self, available_actions, current_actions, parent=None):
         super().__init__(parent)
@@ -4497,6 +4642,136 @@ class PluginManager:
                     logging.info(f"Loaded plugin: {plugin_name}")
         except Exception as e:
             logging.error(f"Failed to load plugin {filepath}: {e}")
+
+class NetworkMonitorSignals(QObject):
+    update = pyqtSignal(float, float) # upload_speed, download_speed (bytes/sec)
+
+class NetworkMonitorWorker(QRunnable):
+    def __init__(self):
+        super().__init__()
+        self.signals = NetworkMonitorSignals()
+        self.is_running = True
+
+    def run(self):
+        if not HAS_PSUTIL:
+            return
+            
+        last_io = psutil.net_io_counters()
+        while self.is_running:
+            time.sleep(1)
+            current_io = psutil.net_io_counters()
+            
+            sent = current_io.bytes_sent - last_io.bytes_sent
+            recv = current_io.bytes_recv - last_io.bytes_recv
+            
+            self.signals.update.emit(sent, recv)
+            last_io = current_io
+
+    def stop(self):
+        self.is_running = False
+
+class NetworkMonitorWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(150)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        
+        self.lbl_down = QLabel("↓ 0 B/s")
+        self.lbl_up = QLabel("↑ 0 B/s")
+        self.lbl_down.setStyleSheet("color: #a6e3a1; font-size: 10px;")
+        self.lbl_up.setStyleSheet("color: #f9e2af; font-size: 10px;")
+        
+        layout.addWidget(self.lbl_down)
+        layout.addWidget(self.lbl_up)
+
+    def update_stats(self, sent, recv):
+        self.lbl_down.setText(f"↓ {self.format_bytes(recv)}/s")
+        self.lbl_up.setText(f"↑ {self.format_bytes(sent)}/s")
+
+    def format_bytes(self, size):
+        power = 2**10
+        n = 0
+        power_labels = {0 : '', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
+        while size > power:
+            size /= power
+            n += 1
+        return f"{size:.1f} {power_labels[n]}B"
+
+class GlobalHotkeysManager(QObject):
+    def __init__(self, window):
+        super().__init__()
+        self.window = window
+        self.hotkeys = {}
+        self.is_active = False
+
+    def start(self):
+        if not HAS_KEYBOARD:
+            logging.warning("Global Hotkeys disabled: 'keyboard' module not found.")
+            return
+            
+        self.is_active = True
+        # Default hotkeys
+        self.register_hotkey("ctrl+alt+p", self.toggle_playback)
+        self.register_hotkey("ctrl+alt+m", self.toggle_mute)
+        self.register_hotkey("ctrl+alt+h", self.toggle_visibility)
+
+    def stop(self):
+        if not HAS_KEYBOARD: return
+        self.is_active = False
+        try:
+            keyboard.unhook_all()
+        except Exception:
+            pass
+
+    def register_hotkey(self, key_combo, callback):
+        if not HAS_KEYBOARD: return
+        try:
+            keyboard.add_hotkey(key_combo, callback)
+            self.hotkeys[key_combo] = callback
+        except Exception as e:
+            logging.error(f"Failed to register hotkey {key_combo}: {e}")
+
+    def toggle_playback(self):
+        # Use QMetaObject.invokeMethod to ensure thread safety with GUI
+        QTimer.singleShot(0, self._toggle_playback_gui)
+
+    def _toggle_playback_gui(self):
+        if self.window.iptv_window and self.window.iptv_window.isVisible():
+            if self.window.iptv_window.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                self.window.iptv_window.player.pause()
+            else:
+                self.window.iptv_window.player.play()
+        elif self.window.active_cast:
+            self.window.toggle_cast_playback()
+        else:
+            # Main preview player
+            if self.window.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                self.window.player.pause()
+            else:
+                self.window.player.play()
+
+    def toggle_mute(self):
+        QTimer.singleShot(0, self._toggle_mute_gui)
+
+    def _toggle_mute_gui(self):
+        if self.window.iptv_window and self.window.iptv_window.isVisible():
+            muted = self.window.iptv_window.audio.isMuted()
+            self.window.iptv_window.audio.setMuted(not muted)
+        else:
+            muted = self.window.audio_output.isMuted()
+            self.window.audio_output.setMuted(not muted)
+
+    def toggle_visibility(self):
+        QTimer.singleShot(0, self._toggle_visibility_gui)
+
+    def _toggle_visibility_gui(self):
+        if self.window.isVisible():
+            self.window.hide()
+        else:
+            self.window.show()
+            self.window.activateWindow()
 
 # -----------------------------------------------------------------------------
 # GUI Implementation
@@ -4940,10 +5215,13 @@ class M3UEditorWindow(QMainWindow):
         # Plugin Manager
         self.plugin_manager = PluginManager()
         
+        # Global Hotkeys
+        self.hotkey_manager = GlobalHotkeysManager(self)
+        
         self.init_ui()
         self.model.logo_loader = self.logo_loader
         self.iptv_window = None
-        self.scheduled_timers = [] # Keep references to timers
+        self.recording_tasks = [] # List of RecordingTask
         self.active_cast = None # Currently connected Chromecast
         self.active_cast_url = None
         self.active_cast_stream_name = None
@@ -4953,6 +5231,7 @@ class M3UEditorWindow(QMainWindow):
         self.cast_sleep_timer = QTimer()
         self.cast_sleep_timer.setSingleShot(True)
         self.cast_sleep_timer.timeout.connect(self.stop_cast_session)
+        self.net_monitor_worker = None
         self.monitor_dialog = None
         
         # Scheduler
@@ -4969,6 +5248,12 @@ class M3UEditorWindow(QMainWindow):
         # Check first run
         if not self.settings.value("first_run_completed", False, type=bool):
             QTimer.singleShot(100, self.open_first_run_wizard)
+            
+        # Version Control
+        self.git_vc = GitVersionControl(get_base_path())
+            
+        # Start Hotkeys
+        self.hotkey_manager.start()
 
     def load_language_patterns(self):
         saved = self.settings.value("language_patterns", {})
@@ -5287,6 +5572,16 @@ class M3UEditorWindow(QMainWindow):
         self.cast_status_widget.btn_stop.clicked.connect(self.stop_cast_session)
         self.statusBar().addPermanentWidget(self.cast_status_widget)
         
+        # Network Monitor Widget
+        if HAS_PSUTIL:
+            self.net_monitor_widget = NetworkMonitorWidget()
+            self.statusBar().addPermanentWidget(self.net_monitor_widget)
+            
+            self.net_monitor_worker = NetworkMonitorWorker()
+            self.net_monitor_worker.signals.update.connect(self.net_monitor_widget.update_stats)
+            # Start in thread pool
+            self.thread_pool.start(self.net_monitor_worker)
+        
         # Cast Remote Dock
         self.cast_remote = CastRemoteDock(self)
         self.cast_remote.setVisible(False)
@@ -5523,6 +5818,10 @@ class M3UEditorWindow(QMainWindow):
         record_action.triggered.connect(self.open_scheduled_recording)
         util_menu.addAction(record_action)
         
+        rec_mgr_action = QAction("Manage Recordings...", self)
+        rec_mgr_action.triggered.connect(self.open_recording_manager)
+        util_menu.addAction(rec_mgr_action)
+        
         diff_action = QAction("Playlist Diff Tool...", self)
         diff_action.triggered.connect(self.open_playlist_diff)
         util_menu.addAction(diff_action)
@@ -5538,6 +5837,10 @@ class M3UEditorWindow(QMainWindow):
         scheduler_action = QAction("Task Scheduler...", self)
         scheduler_action.triggered.connect(self.open_task_scheduler)
         util_menu.addAction(scheduler_action)
+        
+        vc_action = QAction("Version History...", self)
+        vc_action.triggered.connect(self.open_version_history)
+        util_menu.addAction(vc_action)
         
         tools_menu.addSeparator()
         
@@ -5958,6 +6261,7 @@ class M3UEditorWindow(QMainWindow):
             # Save file
             M3UParser.save_file(self.current_file_path, self.entries)
             
+            self.git_vc.commit_changes(self.entries)
             # Verify save
             found = False
             with open(self.current_file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -5996,7 +6300,7 @@ class M3UEditorWindow(QMainWindow):
                 
         logging.info(f"Loading M3U from URL: {url}")
         try:
-            with urllib.request.urlopen(url) as response:
+            with urllib.request.urlopen(url, timeout=30) as response:
                 content = response.read().decode('utf-8', errors='ignore')
                 lines = content.splitlines()
             
@@ -6159,6 +6463,7 @@ class M3UEditorWindow(QMainWindow):
             try:
                 self.create_backup("before_save")
                 M3UParser.save_file(file_name, self.entries)
+                self.git_vc.commit_changes(self.entries)
                 self.current_file_path = file_name
                 self.setWindowTitle(f"Open Source M3U Editor - {os.path.basename(file_name)}")
                 self.status_label.setText(f"Saved to {file_name}")
@@ -6180,6 +6485,7 @@ class M3UEditorWindow(QMainWindow):
                 try:
                     self.create_backup("before_save_enc")
                     M3UParser.save_file(file_name, self.entries, encoding)
+                    self.git_vc.commit_changes(self.entries)
                     self.current_file_path = file_name
                     self.setWindowTitle(f"Open Source M3U Editor - {os.path.basename(file_name)}")
                     self.status_label.setText(f"Saved to {file_name} ({encoding})")
@@ -7961,6 +8267,7 @@ class M3UEditorWindow(QMainWindow):
             
             def start_record():
                 self.status_label.setText(f"Recording started: {entry.name}")
+                task.status = "Recording"
                 worker = FFmpegWorker(cmd)
                 worker.signals.finished.connect(lambda: QMessageBox.information(self, "Recording", f"Recording finished: {entry.name}"))
                 self.thread_pool.start(worker)
@@ -7968,11 +8275,26 @@ class M3UEditorWindow(QMainWindow):
             timer = QTimer()
             timer.setSingleShot(True)
             timer.timeout.connect(start_record)
+            
+            # Create Task Object
+            task = RecordingTask(
+                name=entry.name,
+                url=entry.url,
+                start_time=start_dt,
+                duration=duration_min,
+                output_path=output_file,
+                timer=timer
+            )
+            self.recording_tasks.append(task)
+            
             timer.start(delay_ms)
-            self.scheduled_timers.append(timer) # Keep reference
             
             self.log_action(f"Scheduled recording for {entry.name} at {start_dt.toString()}")
             QMessageBox.information(self, "Scheduled", f"Recording scheduled for {start_dt.toString()}")
+
+    def open_recording_manager(self):
+        dlg = RecordingManagerDialog(self.recording_tasks, self)
+        dlg.exec()
 
     def open_network_scanner(self):
         dlg = NetworkScannerDialog(self)
@@ -8066,8 +8388,8 @@ class M3UEditorWindow(QMainWindow):
              try:
                  if self.active_cast.media_controller.status.player_state == 'IDLE':
                      self.play_next_cast()
-             except:
-                 pass
+             except Exception as e:
+                 logging.error(f"Error checking cast status: {e}")
 
     def toggle_cast_playback(self):
         if self.active_cast:
@@ -8132,6 +8454,11 @@ class M3UEditorWindow(QMainWindow):
         
         ffmpeg_bin = self.get_tool_path("ffmpeg")
         dlg = BitrateAnalyzerDialog(entry.url, self, ffmpeg_bin)
+        dlg.exec()
+
+    def open_version_history(self):
+        history = self.git_vc.get_history()
+        dlg = VersionControlDialog(history, self)
         dlg.exec()
 
     def open_toolbar_customizer(self):
@@ -8379,6 +8706,12 @@ class M3UEditorWindow(QMainWindow):
             else: # Error
                 logging.error(f"Update check failed: {data}")
                 QMessageBox.warning(self, "Check for Updates", f"Failed to check for updates:\n{data}")
+
+    def closeEvent(self, event):
+        self.hotkey_manager.stop()
+        if self.net_monitor_worker:
+            self.net_monitor_worker.stop()
+        super().closeEvent(event)
 
 # -----------------------------------------------------------------------------
 # Main Execution
