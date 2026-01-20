@@ -8704,9 +8704,40 @@ class M3UEditorWindow(QMainWindow):
                 QMessageBox.warning(self, "Check for Updates", f"Failed to check for updates:\n{data}")
 
     def closeEvent(self, event):
+        logging.info("Closing application, cleaning up resources...")
+        
+        # Stop Playback
+        self.player.stop()
+        if self.iptv_window:
+            self.iptv_window.close()
+            
+        # Stop Casting
+        if self.active_cast:
+            try:
+                self.active_cast.quit_app()
+            except Exception as e:
+                logging.error(f"Error stopping cast on exit: {e}")
+
+        # Stop Timers & Managers
+        self.cast_poll_timer.stop()
+        self.cast_sleep_timer.stop()
+        self.scheduler_timer.stop()
         self.hotkey_manager.stop()
+        
         if self.net_monitor_worker:
             self.net_monitor_worker.stop()
+            
+        if self.logo_loader:
+            self.logo_loader.cancel_all()
+            
+        # Clear Thread Pool
+        self.stop_background_tasks()
+        
+        # Clear Caches
+        if hasattr(self, 'model'):
+            self.model.logo_cache.clear()
+            self.model.validation_data.clear()
+            
         super().closeEvent(event)
 
 # -----------------------------------------------------------------------------
